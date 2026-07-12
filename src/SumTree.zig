@@ -29,16 +29,39 @@ fn Node(comptime ValueT: type) type {
     return struct {
         const Self = @This();
 
-        id: usize = 0,
+        const Clone = struct {
+            allocator: Allocator,
+            id: usize = 0,    
+            parent_id: usize = 0,    
+            start: usize = 0,
+            children: ArrayList(usize),
+            summary: Summary = .{},
 
-        ref: *ValueT = undefined,
-        parent: ?*Self = null,
+            pub fn init(allocator: Allocator) !*Clone {
+                const clone = try allocator.create(Clone);
+                clone.* = Clone{
+                    .allocator = allocator,
+                    .children = try ArrayList(usize).initCapacity(allocator, MAX_CHILDREN),
+                };
+                return clone;
+            }
 
-        start: usize = 0,
-        summary: Summary = .{},
+            pub fn deinit(self: *Clone) void {
+                self.children.deinit(self.allocator);
+            }
+        };
 
         allocator: Allocator,
+
+        ref: *ValueT = undefined, // unused
+        parent: ?*Self = null,
+
+        // cloneable data
+        id: usize = 0,
+        parent_id: usize = 0,
+        start: usize = 0,
         children: ArrayList(*Self),
+        summary: Summary = .{},
 
         /// Constructor: Allocates memory for a Node and initializes its children array list.
         pub fn init(allocator: Allocator) !*Self {
@@ -64,6 +87,7 @@ fn Node(comptime ValueT: type) type {
         pub fn attach(self: *Self, child: *Self) !void {
             try self.children.append(self.allocator, child);
             child.parent = self;
+            child.parent_id = self.id;
         }
 
         /// Recalculates this node's summary by summing the summaries of all its children.
@@ -79,20 +103,24 @@ fn Node(comptime ValueT: type) type {
 
         /// Recursively prunes any descendants and immediate children that have zero length.
         /// If a zero-length node is removed, merges adjacent sibling leaf nodes if they are contiguous based on start and L.
-        pub fn prune(self: *Self, tree: anytype) void {
+        pub fn prune(self: *Self, tree: anytype) anyerror!void {
             if (self.isLeaf()) return;
 
             // First recursively prune children
             for (self.children.items) |child| {
-                child.prune(tree);
+                try child.prune(tree);
             }
+
+            const old_len = self.children.items.len;
 
             // Remove zero-length children in-place from list and merge contiguous siblings
             var i: usize = 0;
             while (i < self.children.items.len) {
                 const child = self.children.items[i];
                 if (child.summary.dimensions[0] == 0) {
+                    try tree.cloneNode(self);
                     _ = self.children.orderedRemove(i);
+                    tree.destroyNode(child);
 
                     // Check contiguous leaf merge between left and right siblings
                     if (i > 0 and i < self.children.items.len) {
@@ -102,14 +130,22 @@ fn Node(comptime ValueT: type) type {
                             const left_L = left.summary.dimensions[0];
                             const right_L = right.summary.dimensions[0];
                             if (left.start + left_L == right.start) {
+                                try tree.cloneNode(left);
                                 left.summary = tree.summarize(tree.chunks.items[left.start .. left.start + left_L + right_L]);
-                                _ = self.children.orderedRemove(i);
+                                try tree.cloneNode(self);
+                                const sibling = self.children.orderedRemove(i);
+                                tree.destroyNode(sibling);
                             }
                         }
                     }
                 } else {
                     i += 1;
                 }
+            }
+
+            if (self.children.items.len != old_len) {
+                try tree.cloneNode(self);
+                self.summarize();
             }
         }
     };
@@ -239,7 +275,7 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
             }
             return res;
         }
-        
+
         /// Moves the cursor right by the given distance in the specified metric.
         pub fn seekRight(self: *const Self, distance: usize, metric: u8) Self {
             var curr_node = self.node;
@@ -305,9 +341,15 @@ pub fn SumTree(comptime ValueT: type) type {
         const TreeChunk = ArrayList(ValueT);
         const Summarizer = *const fn ([]const ValueT) Summary;
 
+        enable_history: bool = false,
+
         allocator: Allocator,
         chunks: TreeChunk,
+
+        timestamp: i64 = 0,
+
         nodes: ArrayList(*TreeNode),
+        clones: ArrayList(*TreeNode.Clone),
         root: *TreeNode = undefined,
 
         summarize: Summarizer = defaultSummarizer,
@@ -326,6 +368,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 .allocator = allocator,
                 .chunks = try TreeChunk.initCapacity(allocator, 32),
                 .nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32),
+                .clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32),
                 .root = undefined,
             };
             tree.root = try tree.createNode(&.{});
@@ -338,16 +381,19 @@ pub fn SumTree(comptime ValueT: type) type {
                 c.deinit();
                 self.allocator.destroy(c);
             }
+            for (self.clones.items) |c| {
+                c.deinit();
+                self.allocator.destroy(c);
+            }
             self.nodes.deinit(self.allocator);
+            self.clones.deinit(self.allocator);
             self.chunks.deinit(self.allocator);
         }
 
         /// Allocates a new node, appends it to the tracked list, and assigns its start and summary.
         pub fn createNode(self: *Self, chunk: []const ValueT) !*TreeNode {
-            const node = try TreeNode.init(self.allocator); 
-
+            const node = try TreeNode.init(self.allocator);
             try self.nodes.append(self.allocator, node);
-
             node.id = self.nodes.items.len - 1;
             node.start = self.chunks.items.len;
             node.summary = self.summarize(chunk);
@@ -383,9 +429,11 @@ pub fn SumTree(comptime ValueT: type) type {
             // Split children list in half
             const right_children = target_node.children.items[half..];
             for (right_children) |child| {
+                try self.cloneNode(child);
                 try sibling_node.children.append(self.allocator, child);
                 child.parent = sibling_node;
             }
+            try self.cloneNode(target_node);
             target_node.children.shrinkRetainingCapacity(half);
 
             // Re-summarize both halves
@@ -397,6 +445,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 const new_root = try self.createNode(&.{});
                 self.root = new_root;
 
+                try self.cloneNode(target_node);
                 try new_root.attach(target_node);
                 try new_root.attach(sibling_node);
 
@@ -407,6 +456,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 sibling_node.parent = parent;
 
                 const idx = std.mem.indexOfScalar(*TreeNode, parent.children.items, target_node).?;
+                try self.cloneNode(parent);
                 try parent.children.insert(self.allocator, idx + 1, sibling_node);
 
                 parent.summarize();
@@ -415,20 +465,99 @@ pub fn SumTree(comptime ValueT: type) type {
             }
         }
 
+        fn destroyNode(self: *Self, node: *TreeNode) void {
+            // Retain dangling nodes for history purposes
+            if (self.enable_history) {
+                return;
+            }
+
+            for (node.children.items) |child| {
+                self.destroyNode(child);
+            }
+            if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, node)) |idx| {
+                _ = self.nodes.orderedRemove(idx);
+            }
+            node.deinit();
+            self.allocator.destroy(node);
+        }
+
+        fn cloneNode(self: *Self, target_node: *TreeNode) !void {
+            if (!self.enable_history) {
+                return;
+            }
+
+            const clone = try TreeNode.Clone.init(self.allocator);
+            try self.clones.append(self.allocator, clone);
+            clone.id = target_node.id;
+            clone.parent_id = target_node.parent_id;
+            clone.start = target_node.start;
+            clone.summary = target_node.summary;
+            for (target_node.children.items) |item| {
+                try clone.children.append(self.allocator, item.id);
+            }
+        }
+
+        fn collapseSingleChildNodes(self: *Self, target_node: *TreeNode) anyerror!void {
+            if (target_node.isLeaf()) return;
+
+            // First recurse on children to collapse them from bottom up
+            var i: usize = 0;
+            while (i < target_node.children.items.len) {
+                const child = target_node.children.items[i];
+                try self.collapseSingleChildNodes(child);
+                i += 1;
+            }
+
+            // Now check if target_node itself has only one child
+            if (target_node.children.items.len == 1) {
+                const child = target_node.children.items[0];
+                if (child.isLeaf()) {
+                    // Copy child's properties to target_node
+                    try self.cloneNode(target_node);
+                    target_node.start = child.start;
+                    target_node.summary = child.summary;
+
+                    // Clear target_node's children to make it a leaf
+                    target_node.children.clearRetainingCapacity();
+
+                    // Destroy child node recursively and remove it from tracking list
+                    self.destroyNode(child);
+                } else {
+                    // Promote child's children to target_node
+                    try self.cloneNode(target_node);
+                    target_node.children.clearRetainingCapacity();
+                    for (child.children.items) |c| {
+                        try self.cloneNode(c);
+                        try target_node.children.append(self.allocator, c);
+                        c.parent = target_node;
+                    }
+                    try self.cloneNode(child);
+                    child.children.clearRetainingCapacity();
+
+                    // Destroy the now-empty child node
+                    self.destroyNode(child);
+                }
+            }
+        }
+
         /// Sibling joining B+ tree balancing algorithm:
         /// Joins/merges adjacent sibling internal nodes if their combined children count falls
         /// below 80% of MAX_NODE_CHILDREN. Also collapses the root if it is left with only 1 child.
         fn joinInternalNodes(self: *Self, target_node: *TreeNode) !void {
+            if (target_node.isLeaf()) return;
             if (target_node == self.root) {
                 // Root collapse case: copy child's children directly to the root, keeping root pointer fixed
                 if (self.root.children.items.len == 1) {
                     const child = self.root.children.items[0];
                     if (!child.isLeaf()) {
+                        try self.cloneNode(self.root);
                         self.root.children.clearRetainingCapacity();
                         for (child.children.items) |c| {
+                            try self.cloneNode(c);
                             try self.root.children.append(self.allocator, c);
                             c.parent = self.root;
                         }
+                        try self.cloneNode(child);
                         child.children.clearRetainingCapacity();
                         self.root.summarize();
                     }
@@ -444,11 +573,16 @@ pub fn SumTree(comptime ValueT: type) type {
                 const left_sibling = parent.children.items[idx - 1];
                 const total_count = target_node.children.items.len + left_sibling.children.items.len;
                 if (total_count * 10 < 8 * Config.MAX_NODE_CHILDREN) {
+                    try self.cloneNode(left_sibling);
                     for (target_node.children.items) |child| {
+                        try self.cloneNode(child);
                         try left_sibling.children.append(self.allocator, child);
                         child.parent = left_sibling;
                     }
+                    try self.cloneNode(target_node);
                     target_node.children.clearRetainingCapacity();
+
+                    try self.cloneNode(parent);
                     _ = parent.children.orderedRemove(idx);
 
                     left_sibling.summarize();
@@ -464,11 +598,16 @@ pub fn SumTree(comptime ValueT: type) type {
                 const right_sibling = parent.children.items[idx + 1];
                 const total_count = target_node.children.items.len + right_sibling.children.items.len;
                 if (total_count * 10 < 8 * Config.MAX_NODE_CHILDREN) {
+                    try self.cloneNode(target_node);
                     for (right_sibling.children.items) |child| {
+                        try self.cloneNode(child);
                         try target_node.children.append(self.allocator, child);
                         child.parent = target_node;
                     }
+                    try self.cloneNode(right_sibling);
                     right_sibling.children.clearRetainingCapacity();
+
+                    try self.cloneNode(parent);
                     _ = parent.children.orderedRemove(idx + 1);
 
                     target_node.summarize();
@@ -488,19 +627,20 @@ pub fn SumTree(comptime ValueT: type) type {
                 // Split root leaf case: create prefix/suffix leaves, attach to root, summarize, split root if needed
                 const prefix_node = try self.createNode(&.{});
                 prefix_node.start = target_node.start;
-                prefix_node.summary = self.summarize(self.chunks.items[prefix_node.start .. (prefix_node.start + offset)]);
+                prefix_node.summary = self.summarize(self.chunks.items[prefix_node.start..(prefix_node.start + offset)]);
 
                 const suffix_node = try self.createNode(&.{});
                 suffix_node.start = target_node.start + offset;
-                suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start .. (suffix_node.start + L - offset)]);
+                suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
 
+                try self.cloneNode(self.root);
                 try self.root.attach(prefix_node);
                 try self.root.attach(suffix_node);
-                
+
                 prefix_node.parent.?.summarize();
 
                 try self.splitInternalNode(self.root);
-                
+
                 return suffix_node;
             } else {
                 // Non-root leaf split: insert suffix leaf to parent, update summaries, split parent if needed
@@ -509,22 +649,35 @@ pub fn SumTree(comptime ValueT: type) type {
 
                 const suffix_node = try self.createNode(&.{});
                 suffix_node.start = target_node.start + offset;
-                suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start .. (suffix_node.start + L - offset)]);
+                suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
                 suffix_node.parent = parent_node;
 
-                target_node.summary = self.summarize(self.chunks.items[target_node.start .. (target_node.start + offset)]);
+                try self.cloneNode(target_node);
+                target_node.summary = self.summarize(self.chunks.items[target_node.start..(target_node.start + offset)]);
 
+                try self.cloneNode(parent_node);
                 try parent_node.children.insert(self.allocator, idx + 1, suffix_node);
-                
+
                 var curr_parent = target_node.parent;
                 while (curr_parent) |p| {
+                    try self.cloneNode(p);
                     p.summarize();
                     curr_parent = p.parent;
                 }
 
                 try self.splitInternalNode(parent_node);
-                
+
                 return suffix_node;
+            }
+        }
+
+        fn updateTimestamp(self: *Self) void {
+            var ts: std.posix.timespec = undefined;
+            switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+                .SUCCESS => {
+                    self.timestamp = @intCast(ts.sec);
+                },
+                else => {},
             }
         }
 
@@ -532,6 +685,25 @@ pub fn SumTree(comptime ValueT: type) type {
         /// Seeks cursor location, splits target leaf node if cursor is positioned in the middle,
         /// inserts the new chunk as a sibling node, and propagates splits and summarizations up to the root.
         pub fn insert(self: *Self, chunk: []const ValueT, cursor_: TreeCursor) !TreeCursor {
+            if (chunk.len == 0) {
+                var cursor = cursor_;
+                cursor.absolute = cursor.resolveAbsolute();
+                return cursor;
+            }
+
+            self.updateTimestamp();
+
+            if (chunk.len > Config.MAX_CHUNK_LENGTH) {
+                var cur = cursor_;
+                var start_idx: usize = 0;
+                while (start_idx < chunk.len) {
+                    const end_idx = @min(chunk.len, start_idx + Config.MAX_CHUNK_LENGTH);
+                    const sub_chunk = chunk[start_idx..end_idx];
+                    cur = try self.insert(sub_chunk, cur);
+                    start_idx = end_idx;
+                }
+                return cur;
+            }
             var cursor = cursor_;
             cursor.absolute = cursor.resolveAbsolute();
 
@@ -543,6 +715,7 @@ pub fn SumTree(comptime ValueT: type) type {
             // Check if we can simply append to the target node
             if (offset == L and target_node.start + L == self.chunks.items.len) {
                 try self.chunks.appendSlice(self.allocator, chunk);
+                try self.cloneNode(target_node);
                 target_node.summary = self.summarize(self.chunks.items[target_node.start .. target_node.start + L + chunk.len]);
 
                 var c = cursor;
@@ -553,6 +726,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 // Bubble up summarization updates
                 var curr_parent = target_node.parent;
                 while (curr_parent) |p| {
+                    try self.cloneNode(p);
                     p.summarize();
                     curr_parent = p.parent;
                 }
@@ -563,14 +737,15 @@ pub fn SumTree(comptime ValueT: type) type {
 
             if (target_node == self.root) {
                 // If found node is root, split/insert directly as child
+                try self.cloneNode(self.root);
                 if (offset > 0 and offset < L) {
                     const prefix_node = try self.createNode(&.{});
                     prefix_node.start = target_node.start;
-                    prefix_node.summary = self.summarize(self.chunks.items[prefix_node.start .. (prefix_node.start + offset)]);
+                    prefix_node.summary = self.summarize(self.chunks.items[prefix_node.start..(prefix_node.start + offset)]);
 
                     const suffix_node = try self.createNode(&.{});
                     suffix_node.start = target_node.start + offset;
-                    suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start .. (suffix_node.start + L - offset)]);
+                    suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
 
                     try self.root.attach(prefix_node);
                     try self.root.attach(n);
@@ -599,18 +774,22 @@ pub fn SumTree(comptime ValueT: type) type {
                 if (offset > 0 and offset < L) {
                     const suffix_node = try self.createNode(&.{});
                     suffix_node.start = target_node.start + offset;
-                    suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start .. (suffix_node.start + L - offset)]);
+                    suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
                     suffix_node.parent = parent_node;
 
-                    target_node.summary = self.summarize(self.chunks.items[target_node.start .. (target_node.start + offset)]);
+                    try self.cloneNode(target_node);
+                    target_node.summary = self.summarize(self.chunks.items[target_node.start..(target_node.start + offset)]);
 
+                    try self.cloneNode(parent_node);
                     try parent_node.children.insert(self.allocator, idx + 1, n);
                     n.parent = parent_node;
                     try parent_node.children.insert(self.allocator, idx + 2, suffix_node);
                 } else if (offset == 0) {
+                    try self.cloneNode(parent_node);
                     try parent_node.children.insert(self.allocator, idx, n);
                     n.parent = parent_node;
                 } else {
+                    try self.cloneNode(parent_node);
                     try parent_node.children.insert(self.allocator, idx + 1, n);
                     n.parent = parent_node;
                 }
@@ -627,6 +806,7 @@ pub fn SumTree(comptime ValueT: type) type {
             // Bubble up summarization updates
             var curr_parent = n.parent;
             while (curr_parent) |p| {
+                try self.cloneNode(p);
                 p.summarize();
                 curr_parent = p.parent;
             }
@@ -639,6 +819,8 @@ pub fn SumTree(comptime ValueT: type) type {
         /// zeroing out fully deleted leaves (dimensions[0] = 0) or truncating the start of partially deleted leaves.
         /// Balances and prunes/joins the tree structure on completion.
         pub fn erase(self: *Self, cursor_: TreeCursor, length: usize) !TreeCursor {
+            self.updateTimestamp();
+
             var cursor = cursor_;
             cursor.absolute = cursor.resolveAbsolute();
 
@@ -652,7 +834,14 @@ pub fn SumTree(comptime ValueT: type) type {
 
             // Normalize start of erase by splitting leaf if offset is in the middle
             const L = curr_node.summary.dimensions[0];
-            if (curr_offset > 0 and curr_offset < L) {
+            if (curr_offset == L) {
+                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
+                    curr_node = next_node;
+                    curr_offset = 0;
+                } else {
+                    return cursor;
+                }
+            } else if (curr_offset > 0 and curr_offset < L) {
                 curr_node = try self.splitLeafNode(curr_node, curr_offset);
                 curr_offset = 0;
             }
@@ -662,8 +851,9 @@ pub fn SumTree(comptime ValueT: type) type {
                 const node_size = curr_node.summary.dimensions[0];
                 if (remaining >= node_size) {
                     // Full erase: zero out summary, record affected parent, bubble up summary updates
+                    try self.cloneNode(curr_node);
                     curr_node.summary = .{};
-                    
+
                     if (curr_node.parent) |p| {
                         var found = false;
                         for (affected_parents.items) |item| {
@@ -679,6 +869,7 @@ pub fn SumTree(comptime ValueT: type) type {
 
                     var curr_parent = curr_node.parent;
                     while (curr_parent) |p| {
+                        try self.cloneNode(p);
                         p.summarize();
                         curr_parent = p.parent;
                     }
@@ -693,11 +884,13 @@ pub fn SumTree(comptime ValueT: type) type {
                     }
                 } else {
                     // Partial erase: truncate start offset, re-summarize, bubble up updates
+                    try self.cloneNode(curr_node);
                     curr_node.start += remaining;
-                    curr_node.summary = self.summarize(self.chunks.items[curr_node.start .. (curr_node.start + node_size - remaining)]);
-                    
+                    curr_node.summary = self.summarize(self.chunks.items[curr_node.start..(curr_node.start + node_size - remaining)]);
+
                     var curr_parent = curr_node.parent;
                     while (curr_parent) |p| {
+                        try self.cloneNode(p);
                         p.summarize();
                         curr_parent = p.parent;
                     }
@@ -705,7 +898,7 @@ pub fn SumTree(comptime ValueT: type) type {
                     remaining = 0;
                 }
             }
-            
+
             var c = TreeCursor{
                 .tree = self,
                 .node = curr_node,
@@ -714,26 +907,35 @@ pub fn SumTree(comptime ValueT: type) type {
             };
             c.absolute = c.resolveAbsolute();
 
-            // Prune zero-length nodes and join sibling nodes recursively
+            // Prune zero-length nodes recursively from the root down
+            try self.root.prune(self);
+
+            // Join sibling nodes recursively
             for (affected_parents.items) |parent| {
-                parent.prune(self);
-                try self.joinInternalNodes(parent);
+                if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, parent) != null) {
+                    try self.joinInternalNodes(parent);
+                }
             }
-            
-            var is_detached = false;
-            if (curr_node.parent) |p| {
-                if (std.mem.indexOfScalar(*TreeNode, p.children.items, curr_node) == null) {
+
+            // Collapse redundant single-child internal nodes recursively
+            try self.collapseSingleChildNodes(self.root);
+
+            var is_detached = true;
+            if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, curr_node) != null) {
+                is_detached = false;
+                if (curr_node.parent) |p| {
+                    if (std.mem.indexOfScalar(*TreeNode, p.children.items, curr_node) == null) {
+                        is_detached = true;
+                    }
+                } else if (curr_node != self.root) {
                     is_detached = true;
                 }
-            } else if (curr_node != self.root) {
-                is_detached = true;
             }
             if (is_detached) {
                 c.recalculate();
             }
             return c;
         }
-        
 
         pub fn dump(self: Self, node: *TreeNode, depth: usize) void {
             for (0..depth) |_| std.debug.print("  ", .{});
@@ -754,434 +956,105 @@ pub fn SumTree(comptime ValueT: type) type {
                 self.dump(n, depth + 1);
             }
         }
+
+        pub fn visualize(self: Self, node: *TreeNode) void {
+            var active_paths = [_]bool{false} ** 64;
+            self.visualizeHelper(node, 0, &active_paths, true);
+        }
+
+        fn visualizeHelper(self: Self, node: *TreeNode, depth: usize, active_paths: *[64]bool, is_last: bool) void {
+            if (depth > 0) {
+                for (0..depth - 1) |i| {
+                    if (active_paths[i]) {
+                        std.debug.print("│   ", .{});
+                    } else {
+                        std.debug.print("    ", .{});
+                    }
+                }
+                if (is_last) {
+                    std.debug.print("└── ", .{});
+                } else {
+                    std.debug.print("├── ", .{});
+                }
+            }
+
+            std.debug.print("node {}: ", .{node.id});
+
+            if (node.isLeaf()) {
+                const len = node.summary.dimensions[0];
+                if (len > 0) {
+                    const slice = self.chunks.items[node.start..(node.start + len)];
+                    if (slice.len > 10) {
+                        std.debug.print("\"{s}...{s}\"\n", .{ slice[0..3], slice[slice.len - 3 ..] });
+                    } else {
+                        std.debug.print("\"{s}\"\n", .{slice});
+                    }
+                } else {
+                    std.debug.print("\"\"\n", .{});
+                }
+            } else {
+                std.debug.print("\n", .{});
+            }
+
+            if (depth < 64) {
+                active_paths[depth] = !is_last;
+            }
+
+            const children_count = node.children.items.len;
+            for (node.children.items, 0..) |child, idx| {
+                const child_is_last = (idx == children_count - 1);
+                self.visualizeHelper(child, depth + 1, active_paths, child_is_last);
+            }
+        }
+
+        pub fn visualizeWrite(self: Self, node: *TreeNode, writer: anytype) anyerror!void {
+            var active_paths = [_]bool{false} ** 64;
+            try self.visualizeHelperWrite(node, 0, &active_paths, true, writer);
+        }
+
+        fn visualizeHelperWrite(self: Self, node: *TreeNode, depth: usize, active_paths: *[64]bool, is_last: bool, writer: anytype) anyerror!void {
+            if (depth > 0) {
+                for (0..depth - 1) |i| {
+                    if (active_paths[i]) {
+                        try writer.print("│   ", .{});
+                    } else {
+                        try writer.print("    ", .{});
+                    }
+                }
+                if (is_last) {
+                    try writer.print("└── ", .{});
+                } else {
+                    try writer.print("├── ", .{});
+                }
+            }
+
+            try writer.print("node {}: ", .{node.id});
+
+            if (node.isLeaf()) {
+                const len = node.summary.dimensions[0];
+                if (len > 0) {
+                    const slice = self.chunks.items[node.start..(node.start + len)];
+                    if (slice.len > 10) {
+                        try writer.print("\"{s}...{s}\"\n", .{ slice[0..3], slice[slice.len - 3 ..] });
+                    } else {
+                        try writer.print("\"{s}\"\n", .{slice});
+                    }
+                } else {
+                    try writer.print("\"\"\n", .{});
+                }
+            } else {
+                try writer.print("\n", .{});
+            }
+
+            if (depth < 64) {
+                active_paths[depth] = !is_last;
+            }
+
+            const children_count = node.children.items.len;
+            for (node.children.items, 0..) |child, idx| {
+                const child_is_last = (idx == children_count - 1);
+                try self.visualizeHelperWrite(child, depth + 1, active_paths, child_is_last, writer);
+            }
+        }
     };
 }
-
-test "SumTree tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    var cur = tree.createCursor();
-    _ = try tree.insert("abc", cur);
-    cur = try tree.insert("defgh", tree.createCursor());
-
-    // Currently cur is at node "defgh" with offset 5
-    try std.testing.expectEqual(@as(usize, 5), cur.offset);
-
-    // Seek right by 1 (to get to "abc" offset 1)
-    // "defgh" has length 5. Since we are already at offset 5, seeking right by 1:
-    // - Traverses to next sibling "abc", moves to offset 1
-    const cur2 = cur.seekRight(1, 0);
-    try std.testing.expectEqual(@as(usize, 1), cur2.offset);
-
-    // Seek left by 4 from cur2
-    // - From "abc" offset 1, moves left by 1 to offset 0 (remaining 3)
-    // - Traverses to prev sibling "defgh", moves to offset 2
-    const cur3 = cur2.seekLeft(4, 0);
-    try std.testing.expectEqual(@as(usize, 2), cur3.offset);
-    try std.testing.expectEqualSlices(u8, "defgh", tree.chunks.items[cur3.node.start..(cur3.node.start + cur3.node.summary.dimensions[0])]);
-}
-
-test "SumTree multi-level tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    const root = tree.root; // Root
-
-    const int1 = try tree.createNode(&.{});
-    const int2 = try tree.createNode(&.{});
-    try root.attach(int1);
-    try root.attach(int2);
-
-    const l1 = try tree.createNode("abc");
-    const l2 = try tree.createNode("def");
-    try int1.attach(l1);
-    try int1.attach(l2);
-
-    const l3 = try tree.createNode("ghi");
-    const l4 = try tree.createNode("jkl");
-    try int2.attach(l3);
-    try int2.attach(l4);
-
-    // Populate chunks array
-    try tree.chunks.appendSlice(allocator, "abcdefghijkl");
-
-    // Summarize the internal nodes
-    int1.summarize();
-    int2.summarize();
-    root.summarize();
-
-    // Verify root summary in metric 0 is 12 (3 + 3 + 3 + 3)
-    try std.testing.expectEqual(@as(usize, 12), root.summary.dimensions[0]);
-
-    // Create a cursor at l1, offset 0
-    const cur = tree.createCursorAt(l1, 0);
-
-    // Seek right by 11
-    const cur_right = cur.seekRight(11, 0);
-    // 11 bytes from start of "abc" (index 0) should be at "jkl" offset 2 (index 11)
-    try std.testing.expectEqual(l4, cur_right.node);
-    try std.testing.expectEqual(@as(usize, 2), cur_right.offset);
-
-    // Seek left by 10 from cur_right
-    const cur_left = cur_right.seekLeft(10, 0);
-    // 10 bytes left from "jkl" offset 2 (index 11) should be at "abc" offset 1 (index 1)
-    try std.testing.expectEqual(l1, cur_left.node);
-    try std.testing.expectEqual(@as(usize, 1), cur_left.offset);
-
-    // Create a cursor at root, offset 0 (using tree.createCursor())
-    const cur_root = tree.createCursor();
-    const cur_root_seek = cur_root.seekRight(10, 0);
-    // 10 bytes from start of tree should be at "jkl" offset 1
-    try std.testing.expectEqual(l4, cur_root_seek.node);
-    try std.testing.expectEqual(@as(usize, 1), cur_root_seek.offset);
-}
-
-test "SumTree split tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    var cur = tree.createCursor();
-    // First insert to root (makes root contain "abcdef")
-    cur = try tree.insert("abcdef", cur);
-
-    // Cursor is currently at end of "abcdef" (offset 6)
-    // Let's seek left by 4 to offset 2 (which is in the middle of "abcdef")
-    const cur_middle = cur.seekLeft(4, 0);
-    try std.testing.expectEqual(@as(usize, 2), cur_middle.offset);
-
-    // Insert "XYZ" at offset 2 (should trigger split)
-    const cur_after = try tree.insert("XYZ", cur_middle);
-
-    // After insert, the tree root should have 3 children: "ab", "XYZ", "cdef"
-    try std.testing.expectEqual(@as(usize, 3), tree.root.children.items.len);
-
-    const c1 = tree.root.children.items[0];
-    const c2 = tree.root.children.items[1];
-    const c3 = tree.root.children.items[2];
-
-    try std.testing.expectEqualSlices(u8, "ab", tree.chunks.items[c1.start..(c1.start + c1.summary.dimensions[0])]);
-    try std.testing.expectEqualSlices(u8, "XYZ", tree.chunks.items[c2.start..(c2.start + c2.summary.dimensions[0])]);
-    try std.testing.expectEqualSlices(u8, "cdef", tree.chunks.items[c3.start..(c3.start + c3.summary.dimensions[0])]);
-
-    // The cursor returned by insert should point to the new node "XYZ" at its end (offset 3)
-    try std.testing.expectEqual(c2, cur_after.node);
-    try std.testing.expectEqual(@as(usize, 3), cur_after.offset);
-}
-
-test "SumTree erase tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    var cur = tree.createCursor();
-    cur = try tree.insert("abcdef", cur);
-
-    // Erase 3 bytes starting at offset 2 (erases "cde")
-    const cur_middle = cur.seekLeft(4, 0); // offset 2
-    const cur_after = try tree.erase(cur_middle, 3);
-
-    // root should still have 2 active children (prefix "ab" and suffix "f")
-    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
-
-    const c1 = tree.root.children.items[0];
-    const c2 = tree.root.children.items[1];
-
-    try std.testing.expectEqualSlices(u8, "ab", tree.chunks.items[c1.start..(c1.start + c1.summary.dimensions[0])]);
-    try std.testing.expectEqualSlices(u8, "f", tree.chunks.items[c2.start..(c2.start + c2.summary.dimensions[0])]);
-
-    // Root total dimensions[0] should be 3
-    try std.testing.expectEqual(@as(usize, 3), tree.root.summary.dimensions[0]);
-
-    // Cursor returned should point to the suffix node "f" at offset 0
-    try std.testing.expectEqual(c2, cur_after.node);
-    try std.testing.expectEqual(@as(usize, 0), cur_after.offset);
-}
-
-test "Node prune tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer {
-        tree.deinit();
-        allocator.destroy(tree);
-    }
-
-    const root = tree.root;
-
-    // Create children for root
-    const c1 = try tree.createNode("abc");
-    const c2 = try tree.createNode(""); // length 0
-    const c3 = try tree.createNode("def");
-
-    try root.attach(c1);
-    try root.attach(c2);
-    try root.attach(c3);
-
-    try std.testing.expectEqual(@as(usize, 3), root.children.items.len);
-
-    // Call prune
-    root.prune(tree);
-
-    // After prune, c2 (length 0) should be removed
-    try std.testing.expectEqual(@as(usize, 2), root.children.items.len);
-    try std.testing.expectEqual(c1, root.children.items[0]);
-    try std.testing.expectEqual(c3, root.children.items[1]);
-}
-
-test "SumTree split internal tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    
-    // Save & set MAX_NODE_CHILDREN to 4 to isolate this test
-    const orig_max = Config.MAX_NODE_CHILDREN;
-    defer Config.MAX_NODE_CHILDREN = orig_max;
-    Config.MAX_NODE_CHILDREN = 4;
-
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    _ = try tree.insert("a", tree.createCursor());
-    _ = try tree.insert("b", tree.createCursor());
-    _ = try tree.insert("c", tree.createCursor());
-    _ = try tree.insert("d", tree.createCursor());
-    _ = try tree.insert("e", tree.createCursor());
-
-    // Root should have split and now be an internal node with 2 child internal nodes
-    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
-
-    const left_internal = tree.root.children.items[0];
-    const right_internal = tree.root.children.items[1];
-
-    try std.testing.expectEqual(@as(usize, 2), left_internal.children.items.len);
-    try std.testing.expectEqual(@as(usize, 3), right_internal.children.items.len);
-}
-
-test "SumTree split internal tests with runtime config" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    
-    // Save & set MAX_NODE_CHILDREN to 2 at runtime
-    const orig_max = Config.MAX_NODE_CHILDREN;
-    defer Config.MAX_NODE_CHILDREN = orig_max;
-    Config.MAX_NODE_CHILDREN = 2;
-
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    _ = try tree.insert("a", tree.createCursor());
-    _ = try tree.insert("b", tree.createCursor());
-    _ = try tree.insert("c", tree.createCursor()); // Should trigger split since children count (3) > max (2)
-
-    // Root should have split and now be an internal node with 2 child internal nodes
-    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
-
-    const left_internal = tree.root.children.items[0];
-    const right_internal = tree.root.children.items[1];
-
-    try std.testing.expectEqual(@as(usize, 1), left_internal.children.items.len);
-    try std.testing.expectEqual(@as(usize, 2), right_internal.children.items.len);
-}
-
-test "SumTree join internal tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    
-    const orig_max = Config.MAX_NODE_CHILDREN;
-    defer Config.MAX_NODE_CHILDREN = orig_max;
-    Config.MAX_NODE_CHILDREN = 4;
-
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    _ = try tree.insert("a", tree.createCursor());
-    _ = try tree.insert("b", tree.createCursor());
-    _ = try tree.insert("c", tree.createCursor());
-    _ = try tree.insert("d", tree.createCursor());
-    _ = try tree.insert("e", tree.createCursor());
-
-    // Root should have split (children count = 2)
-    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
-
-    // Erase "b"
-    // "e" (1), "d" (1), "c" (1), "b" (1), "a" (1)
-    // So "b" starts at offset 3.
-    const cur_b = tree.createCursor().seekRight(3, 0);
-    _ = try tree.erase(cur_b, 1);
-
-    // Total count is still 1 + 3 = 4, so no join yet.
-    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
-
-    // Erase "c"
-    // After erasing "b", we have "e" (1), "d" (1), "c" (1), "a" (1)
-    // So "c" starts at offset 2.
-    const cur_c = tree.createCursor().seekRight(2, 0);
-    _ = try tree.erase(cur_c, 1);
-
-    // Now total count is 1 + 2 = 3. Since 30 < 32, it should join and the root should collapse!
-    // The root should now have 3 children ("a", "d", "e") because it collapsed back to the single-level internal node!
-    try std.testing.expectEqual(@as(usize, 3), tree.root.children.items.len);
-    
-    // Root summary in metric 0 should be 3 ("a", "d", "e" = 1 + 1 + 1 = 3)
-    try std.testing.expectEqual(@as(usize, 3), tree.root.summary.dimensions[0]);
-}
-
-test "Cursor absolute position tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    var cur = tree.createCursor();
-    // Start at absolute 0
-    try std.testing.expectEqual(@as(usize, 0), cur.absolute);
-
-    cur = try tree.insert("abc", cur);
-    // After insert of "abc", cur points at end of "abc" (absolute 3)
-    try std.testing.expectEqual(@as(usize, 3), cur.absolute);
-
-    cur = try tree.insert("def", cur);
-    // After insert of "def", cur points at end of "def" (absolute 6)
-    try std.testing.expectEqual(@as(usize, 6), cur.absolute);
-
-    // Seek left by 4
-    const cur_left = cur.seekLeft(4, 0);
-    try std.testing.expectEqual(@as(usize, 2), cur_left.absolute);
-    try std.testing.expectEqual(@as(usize, 2), cur_left.resolveAbsolute());
-
-    // Seek right by 3
-    const cur_right = cur_left.seekRight(3, 0);
-    try std.testing.expectEqual(@as(usize, 5), cur_right.absolute);
-
-    // Create a cursor at absolute 5
-    var cur_rec = tree.createCursor();
-    cur_rec.absolute = 5;
-    // Recalculate
-    cur_rec.recalculate();
-    // Verify it matches cur_right
-    try std.testing.expectEqual(cur_right.node, cur_rec.node);
-    try std.testing.expectEqual(cur_right.offset, cur_rec.offset);
-    try std.testing.expectEqual(cur_right.absolute, cur_rec.absolute);
-}
-
-test "SumTree insert append optimization tests" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer tree.deinit();
-
-    var cur = tree.createCursor();
-    cur = try tree.insert("abc", cur);
-    // Initially, tree.root has no children, it is a leaf of length 3
-    try std.testing.expectEqual(@as(usize, 0), tree.root.children.items.len);
-    try std.testing.expectEqual(@as(usize, 3), tree.root.summary.dimensions[0]);
-
-    cur = try tree.insert("def", cur);
-    // Since we inserted at the end, it should have appended directly to tree.root leaf!
-    // No new node should have been created, root children len should still be 0.
-    try std.testing.expectEqual(@as(usize, 0), tree.root.children.items.len);
-    try std.testing.expectEqual(@as(usize, 6), tree.root.summary.dimensions[0]);
-
-    // Backing chunks should be "abcdef"
-    try std.testing.expectEqualSlices(u8, "abcdef", tree.chunks.items);
-}
-
-fn randomWord(rand: std.Random, buf: []u8) []const u8 {
-    const len = rand.intRangeAtMost(usize, 1, 10);
-    for (0..len) |i| {
-        buf[i] = rand.intRangeAtMost(u8, 'a', 'z');
-    }
-    return buf[0..len];
-}
-
-test "SumTree 200 words random insert and erase fuzz test" {
-    const allocator = std.testing.allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer {
-        tree.deinit();
-        allocator.destroy(tree);
-    }
-
-    var prng = std.Random.DefaultPrng.init(0x12345678);
-    const rand = prng.random();
-
-    // 1. Insertion Phase: 200 random words
-    var word_buf: [16]u8 = undefined;
-    for (0..200) |_| {
-        const word = randomWord(rand, &word_buf);
-        const total_len = tree.root.summary.dimensions[0];
-        const pos = if (total_len == 0) 0 else rand.intRangeAtMost(usize, 0, total_len);
-
-        const cur = tree.createCursor().seekRight(pos, 0);
-        _ = try tree.insert(word, cur);
-    }
-
-    // 2. Deletion Phase: 200 random erasures
-    for (0..2000) |_| {
-        const total_len = tree.root.summary.dimensions[0];
-        if (total_len == 0) break;
-
-        const pos = rand.intRangeLessThan(usize, 0, total_len);
-        const len = rand.intRangeAtMost(usize, 1, @min(10, total_len - pos));
-
-        const cur = tree.createCursor().seekRight(pos, 0);
-        _ = try tree.erase(cur, len);
-    }
-}
-
-test "Node prune with contiguous sibling merging" {
-    const allocator = std.heap.page_allocator;
-    const S = SumTree(u8);
-    const tree = try S.init(allocator);
-    defer {
-        tree.deinit();
-        allocator.destroy(tree);
-    }
-
-    // Append contiguous chunks to backing chunks
-    try tree.chunks.appendSlice(allocator, "abcdef");
-
-    const root = tree.root;
-
-    // Create children for root
-    const c1 = try tree.createNode("abc"); // start = 0, length = 3
-    const c2 = try tree.createNode("");    // length = 0, start = 3
-    const c3 = try tree.createNode("def"); // start = 3, length = 3
-    
-    // Override starts manually to make them contiguous starting from index 0
-    c1.start = 0;
-    c2.start = 3;
-    c3.start = 3;
-
-    try root.attach(c1);
-    try root.attach(c2);
-    try root.attach(c3);
-
-    try std.testing.expectEqual(@as(usize, 3), root.children.items.len);
-
-    // Call prune with tree
-    root.prune(tree);
-
-    // After prune, c2 should be removed, and c1 and c3 should merge because they are contiguous
-    // Root should now have only 1 child (c1) representing "abcdef"
-    try std.testing.expectEqual(@as(usize, 1), root.children.items.len);
-    try std.testing.expectEqual(c1, root.children.items[0]);
-    try std.testing.expectEqual(@as(usize, 6), c1.summary.dimensions[0]);
-}
-
-
-
-
-
-
-
-
-
