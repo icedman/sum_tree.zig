@@ -990,6 +990,15 @@ pub fn SumTree(comptime ValueT: type) type {
                 clone.deinit();
                 self.allocator.destroy(clone);
             }
+
+            // Restore self.root to the topmost ancestor of the first node
+            if (self.nodes.items.len > 0) {
+                var curr = self.nodes.items[0];
+                while (curr.parent) |p| {
+                    curr = p;
+                }
+                self.root = curr;
+            }
         }
 
         pub fn dump(self: Self, node: *TreeNode, depth: usize) void {

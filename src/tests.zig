@@ -518,35 +518,73 @@ test "Node prune with contiguous sibling merging" {
     try std.testing.expectEqual(@as(usize, 6), c1.summary.dimensions[0]);
 }
 
-test "SumTree history and undo test" {
+test "SumTree comprehensive history and undo test (insert, erase, split, join)" {
     const allocator = std.heap.page_allocator;
     const S = SumTree(u8);
+    
+    // Save & set MAX_NODE_CHILDREN to 3 at runtime to trigger splits/joins easily
+    const orig_max = Config.MAX_NODE_CHILDREN;
+    defer Config.MAX_NODE_CHILDREN = orig_max;
+    Config.MAX_NODE_CHILDREN = 3;
+
     const tree = try S.init(allocator);
     defer tree.deinit();
 
     // Enable history tracking
     tree.enable_history = true;
 
-    var cur = tree.createCursor();
-    cur = try tree.insert("hello", cur);
+    // Step 0: State 0 (Empty)
+    try std.testing.expectEqual(@as(usize, 0), tree.root.summary.dimensions[0]);
+
+    // Step 1: Insert "abc" at offset 0 -> State 1
+    _ = try tree.insert("abc", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 3), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 0), tree.root.children.items.len); // Still a single leaf root
+
+    // Step 2: Insert "def" at offset 0 -> State 2
+    _ = try tree.insert("def", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 6), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len); // Split root!
+
+    // Step 3: Insert "ghi" at offset 0 -> State 3
+    _ = try tree.insert("ghi", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 9), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 3), tree.root.children.items.len); // 3 children under root
+
+    // Step 4: Insert "jkl" at offset 0 -> State 4 (triggers split of root internal node since 4 children > MAX_NODE_CHILDREN)
+    _ = try tree.insert("jkl", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 12), tree.root.summary.dimensions[0]);
+    // Root split should result in root having 2 child internal nodes
+    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
+
+    // Step 5: Erase 6 bytes starting at offset 0 -> State 5 (triggers join of internal nodes / root collapse)
+    _ = try tree.erase(tree.createCursor(), 6);
+    try std.testing.expectEqual(@as(usize, 6), tree.root.summary.dimensions[0]);
+
+    // Now roll back step-by-step and verify restoration
     
-    // Total len should be 5
-    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
-
-    // Insert "world"
-    cur = try tree.insert("world", cur);
-    try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
-
-    // Undo the last operation ("world")
+    // Undo erase (revert to State 4)
     try tree.undo();
+    try std.testing.expectEqual(@as(usize, 12), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
 
-    // Total len should revert to 5
-    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
-
-    // Undo the first operation ("hello")
+    // Undo insert "jkl" (revert to State 3)
     try tree.undo();
+    try std.testing.expectEqual(@as(usize, 9), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 3), tree.root.children.items.len);
 
-    // Total len should revert to 0
+    // Undo insert "ghi" (revert to State 2)
+    try tree.undo();
+    try std.testing.expectEqual(@as(usize, 6), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 2), tree.root.children.items.len);
+
+    // Undo insert "def" (revert to State 1)
+    try tree.undo();
+    try std.testing.expectEqual(@as(usize, 3), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 0), tree.root.children.items.len);
+
+    // Undo insert "abc" (revert to State 0)
+    try tree.undo();
     try std.testing.expectEqual(@as(usize, 0), tree.root.summary.dimensions[0]);
 }
 
