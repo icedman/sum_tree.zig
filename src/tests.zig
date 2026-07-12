@@ -517,3 +517,36 @@ test "Node prune with contiguous sibling merging" {
     try std.testing.expectEqual(c1, root.children.items[0]);
     try std.testing.expectEqual(@as(usize, 6), c1.summary.dimensions[0]);
 }
+
+test "SumTree history and undo test" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // Enable history tracking
+    tree.enable_history = true;
+
+    var cur = tree.createCursor();
+    cur = try tree.insert("hello", cur);
+    
+    // Total len should be 5
+    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
+
+    // Insert "world"
+    cur = try tree.insert("world", cur);
+    try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
+
+    // Undo the last operation ("world")
+    try tree.undo();
+
+    // Total len should revert to 5
+    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
+
+    // Undo the first operation ("hello")
+    try tree.undo();
+
+    // Total len should revert to 0
+    try std.testing.expectEqual(@as(usize, 0), tree.root.summary.dimensions[0]);
+}
+

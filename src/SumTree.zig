@@ -32,15 +32,18 @@ fn Node(comptime ValueT: type) type {
         const Clone = struct {
             allocator: Allocator,
             id: usize = 0,    
-            parent_id: usize = 0,    
+            parent_id: ?usize = null,    
             start: usize = 0,
             children: ArrayList(usize),
             summary: Summary = .{},
+
+            timestamp: i64 = 0,
 
             pub fn init(allocator: Allocator) !*Clone {
                 const clone = try allocator.create(Clone);
                 clone.* = Clone{
                     .allocator = allocator,
+                    .parent_id = null,
                     .children = try ArrayList(usize).initCapacity(allocator, MAX_CHILDREN),
                 };
                 return clone;
@@ -58,7 +61,7 @@ fn Node(comptime ValueT: type) type {
 
         // cloneable data
         id: usize = 0,
-        parent_id: usize = 0,
+        parent_id: ?usize = null,
         start: usize = 0,
         children: ArrayList(*Self),
         summary: Summary = .{},
@@ -68,6 +71,7 @@ fn Node(comptime ValueT: type) type {
             const node = try allocator.create(Self);
             node.* = Self{
                 .allocator = allocator,
+                .parent_id = null,
                 .children = try ArrayList(*Self).initCapacity(allocator, MAX_CHILDREN),
             };
             return node;
@@ -495,6 +499,7 @@ pub fn SumTree(comptime ValueT: type) type {
             for (target_node.children.items) |item| {
                 try clone.children.append(self.allocator, item.id);
             }
+            clone.timestamp = self.timestamp;
         }
 
         fn collapseSingleChildNodes(self: *Self, target_node: *TreeNode) anyerror!void {
@@ -673,11 +678,17 @@ pub fn SumTree(comptime ValueT: type) type {
 
         fn updateTimestamp(self: *Self) void {
             var ts: std.posix.timespec = undefined;
+            var new_time: i64 = 0;
             switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
                 .SUCCESS => {
-                    self.timestamp = @intCast(ts.sec);
+                    new_time = @intCast(ts.sec * std.time.ns_per_s + ts.nsec);
                 },
                 else => {},
+            }
+            if (new_time <= self.timestamp) {
+                self.timestamp += 1;
+            } else {
+                self.timestamp = new_time;
             }
         }
 
@@ -935,6 +946,50 @@ pub fn SumTree(comptime ValueT: type) type {
                 c.recalculate();
             }
             return c;
+        }
+
+        pub fn undo(self: *Self) !void {
+            const count = self.clones.items.len;
+            if (count == 0) return;
+
+            var timestamp: i64 = 0;
+            var i = count;
+
+            while (i > 0) : (i -= 1) {
+                const clone = self.clones.items[i - 1];
+
+                // Stop if timestamps don’t match
+                if (timestamp != 0 and timestamp != clone.timestamp) break;
+                timestamp = clone.timestamp;
+
+                var shadow: *TreeNode = self.nodes.items[clone.id];
+                
+                if (clone.parent_id) |p_id| {
+                    shadow.parent = self.nodes.items[p_id];
+                    shadow.parent_id = p_id;
+                } else {
+                    shadow.parent = null;
+                    shadow.parent_id = null;
+                }
+
+                shadow.start = clone.start;
+                shadow.summary = clone.summary;
+                shadow.children.clearRetainingCapacity();
+
+                for (clone.children.items) |item| {
+                    var child: *TreeNode = self.nodes.items[item];
+                    try shadow.children.append(shadow.allocator, child);
+                    child.parent = shadow;
+                    child.parent_id = shadow.id;
+                }
+            }
+
+            // Pop and destroy the undone clones
+            while (self.clones.items.len > i) {
+                const clone = self.clones.pop().?;
+                clone.deinit();
+                self.allocator.destroy(clone);
+            }
         }
 
         pub fn dump(self: Self, node: *TreeNode, depth: usize) void {
