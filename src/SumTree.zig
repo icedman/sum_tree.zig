@@ -55,6 +55,11 @@ fn Node(comptime ValueT: type) type {
             self.children.deinit(self.allocator);
         }
 
+        /// Checks if this node is a leaf node (i.e. has no children).
+        pub fn isLeaf(self: *const Self) bool {
+            return self.children.items.len == 0;
+        }
+
         /// Attaches a child node to this node and updates the child's parent pointer.
         pub fn attach(self: *Self, child: *Self) !void {
             try self.children.append(self.allocator, child);
@@ -75,6 +80,8 @@ fn Node(comptime ValueT: type) type {
         /// Recursively prunes any descendants and immediate children that have zero length.
         /// If a zero-length node is removed, merges adjacent sibling leaf nodes if they are contiguous based on start and L.
         pub fn prune(self: *Self, tree: anytype) void {
+            if (self.isLeaf()) return;
+
             // First recursively prune children
             for (self.children.items) |child| {
                 child.prune(tree);
@@ -91,7 +98,7 @@ fn Node(comptime ValueT: type) type {
                     if (i > 0 and i < self.children.items.len) {
                         const left = self.children.items[i - 1];
                         const right = self.children.items[i];
-                        if (left.children.items.len == 0 and right.children.items.len == 0) {
+                        if (left.isLeaf() and right.isLeaf()) {
                             const left_L = left.summary.dimensions[0];
                             const right_L = right.summary.dimensions[0];
                             if (left.start + left_L == right.start) {
@@ -152,7 +159,7 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
                     if (idx + 1 < p.children.items.len) {
                         var next_sibling = p.children.items[idx + 1];
                         // Walk down to the leftmost leaf child of the sibling subtree
-                        while (next_sibling.children.items.len > 0) {
+                        while (!next_sibling.isLeaf()) {
                             next_sibling = next_sibling.children.items[0];
                         }
                         return next_sibling;
@@ -171,7 +178,7 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
                     if (idx > 0) {
                         var prev_sibling = p.children.items[idx - 1];
                         // Walk down to the rightmost leaf child of the sibling subtree
-                        while (prev_sibling.children.items.len > 0) {
+                        while (!prev_sibling.isLeaf()) {
                             prev_sibling = prev_sibling.children.items[prev_sibling.children.items.len - 1];
                         }
                         return prev_sibling;
@@ -188,7 +195,7 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
             var curr_offset = self.offset;
 
             // Normalize: if the cursor is at an internal node, descend to the leftmost leaf
-            while (curr_node.children.items.len > 0) {
+            while (!curr_node.isLeaf()) {
                 curr_node = curr_node.children.items[0];
                 curr_offset = 0;
             }
@@ -239,7 +246,7 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
             var curr_offset = self.offset;
 
             // Normalize: if the cursor is at an internal node, descend to the leftmost leaf
-            while (curr_node.children.items.len > 0) {
+            while (!curr_node.isLeaf()) {
                 curr_node = curr_node.children.items[0];
                 curr_offset = 0;
             }
@@ -416,7 +423,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 // Root collapse case: copy child's children directly to the root, keeping root pointer fixed
                 if (self.root.children.items.len == 1) {
                     const child = self.root.children.items[0];
-                    if (child.children.items.len > 0) {
+                    if (!child.isLeaf()) {
                         self.root.children.clearRetainingCapacity();
                         for (child.children.items) |c| {
                             try self.root.children.append(self.allocator, c);
@@ -733,7 +740,7 @@ pub fn SumTree(comptime ValueT: type) type {
             // std.debug.print("?{*} -> {*}\n", .{ node, node.parent });
             std.debug.print("node {}: ", .{node.id});
 
-            if (node.children.items.len == 0) {
+            if (node.isLeaf()) {
                 const len = node.summary.dimensions[0];
                 if (len > 0) {
                     const slice = self.chunks.items[node.start..(node.start + len)];
