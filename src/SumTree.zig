@@ -73,18 +73,33 @@ fn Node(comptime ValueT: type) type {
         }
 
         /// Recursively prunes any descendants and immediate children that have zero length.
-        pub fn prune(self: *Self) void {
+        /// If a zero-length node is removed, merges adjacent sibling leaf nodes if they are contiguous based on start and L.
+        pub fn prune(self: *Self, tree: anytype) void {
             // First recursively prune children
             for (self.children.items) |child| {
-                child.prune();
+                child.prune(tree);
             }
 
-            // Remove zero-length children in-place from list
+            // Remove zero-length children in-place from list and merge contiguous siblings
             var i: usize = 0;
             while (i < self.children.items.len) {
                 const child = self.children.items[i];
                 if (child.summary.dimensions[0] == 0) {
                     _ = self.children.orderedRemove(i);
+
+                    // Check contiguous leaf merge between left and right siblings
+                    if (i > 0 and i < self.children.items.len) {
+                        const left = self.children.items[i - 1];
+                        const right = self.children.items[i];
+                        if (left.children.items.len == 0 and right.children.items.len == 0) {
+                            const left_L = left.summary.dimensions[0];
+                            const right_L = right.summary.dimensions[0];
+                            if (left.start + left_L == right.start) {
+                                left.summary = tree.summarize(tree.chunks.items[left.start .. left.start + left_L + right_L]);
+                                _ = self.children.orderedRemove(i);
+                            }
+                        }
+                    }
                 } else {
                     i += 1;
                 }
@@ -600,6 +615,7 @@ pub fn SumTree(comptime ValueT: type) type {
             var c = cursor;
             c.node = n;
             c.offset = n.summary.dimensions[0];
+            c.absolute = c.resolveAbsolute();
 
             // Bubble up summarization updates
             var curr_parent = n.parent;
@@ -608,7 +624,6 @@ pub fn SumTree(comptime ValueT: type) type {
                 curr_parent = p.parent;
             }
 
-            c.recalculate();
             return c;
         }
 
@@ -694,11 +709,21 @@ pub fn SumTree(comptime ValueT: type) type {
 
             // Prune zero-length nodes and join sibling nodes recursively
             for (affected_parents.items) |parent| {
-                parent.prune();
+                parent.prune(self);
                 try self.joinInternalNodes(parent);
             }
             
-            c.recalculate();
+            var is_detached = false;
+            if (curr_node.parent) |p| {
+                if (std.mem.indexOfScalar(*TreeNode, p.children.items, curr_node) == null) {
+                    is_detached = true;
+                }
+            } else if (curr_node != self.root) {
+                is_detached = true;
+            }
+            if (is_detached) {
+                c.recalculate();
+            }
             return c;
         }
         
@@ -877,7 +902,10 @@ test "Node prune tests" {
     const allocator = std.heap.page_allocator;
     const S = SumTree(u8);
     const tree = try S.init(allocator);
-    defer tree.deinit();
+    defer {
+        tree.deinit();
+        allocator.destroy(tree);
+    }
 
     const root = tree.root;
 
@@ -893,7 +921,7 @@ test "Node prune tests" {
     try std.testing.expectEqual(@as(usize, 3), root.children.items.len);
 
     // Call prune
-    root.prune();
+    root.prune(tree);
 
     // After prune, c2 (length 0) should be removed
     try std.testing.expectEqual(@as(usize, 2), root.children.items.len);
@@ -1101,6 +1129,47 @@ test "SumTree 200 words random insert and erase fuzz test" {
         _ = try tree.erase(cur, len);
     }
 }
+
+test "Node prune with contiguous sibling merging" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer {
+        tree.deinit();
+        allocator.destroy(tree);
+    }
+
+    // Append contiguous chunks to backing chunks
+    try tree.chunks.appendSlice(allocator, "abcdef");
+
+    const root = tree.root;
+
+    // Create children for root
+    const c1 = try tree.createNode("abc"); // start = 0, length = 3
+    const c2 = try tree.createNode("");    // length = 0, start = 3
+    const c3 = try tree.createNode("def"); // start = 3, length = 3
+    
+    // Override starts manually to make them contiguous starting from index 0
+    c1.start = 0;
+    c2.start = 3;
+    c3.start = 3;
+
+    try root.attach(c1);
+    try root.attach(c2);
+    try root.attach(c3);
+
+    try std.testing.expectEqual(@as(usize, 3), root.children.items.len);
+
+    // Call prune with tree
+    root.prune(tree);
+
+    // After prune, c2 should be removed, and c1 and c3 should merge because they are contiguous
+    // Root should now have only 1 child (c1) representing "abcdef"
+    try std.testing.expectEqual(@as(usize, 1), root.children.items.len);
+    try std.testing.expectEqual(c1, root.children.items[0]);
+    try std.testing.expectEqual(@as(usize, 6), c1.summary.dimensions[0]);
+}
+
 
 
 
