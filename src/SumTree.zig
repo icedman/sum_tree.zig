@@ -1239,6 +1239,135 @@ pub fn SumTree(comptime ValueT: type) type {
                 i += 1;
             }
         }
+        
+        pub fn collectLeaves(self: *Self, cursor_: TreeCursor, length: usize, bucket: *ArrayList(*TreeNode)) !TreeCursor {
+            if (length == 0) {
+                return cursor_;
+            }
+
+            var cursor1 = cursor_;
+            // Normalize cursor1 to be at leaf level if it's at an internal node
+            while (!cursor1.node.isLeaf()) {
+                cursor1.node = cursor1.node.children.items[0];
+                cursor1.offset = 0;
+            }
+
+            const cursor2 = cursor1.seekRight(length, 0);
+
+            var curr_node = cursor1.node;
+            var curr_offset = cursor1.offset;
+
+            // If the start cursor is at the end of the node, advance to the next leaf
+            if (curr_offset == curr_node.summary.dimensions[0]) {
+                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
+                    curr_node = next_node;
+                    curr_offset = 0;
+                } else {
+                    return cursor2;
+                }
+            }
+
+            // Loop and collect leaf nodes until we reach cursor2.node
+            while (true) {
+                try bucket.append(self.allocator, curr_node);
+
+                if (curr_node == cursor2.node) {
+                    break;
+                }
+
+                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
+                    curr_node = next_node;
+                } else {
+                    break;
+                }
+            }
+
+            return cursor2;
+        }
+        
+        pub fn collectNodes(self: *Self, cursor_: TreeCursor, length: usize, bucket: *ArrayList(*TreeNode)) !TreeCursor {
+            if (length == 0) {
+                return cursor_;
+            }
+
+            var cursor1 = cursor_;
+            // Normalize cursor1 to be at leaf level if it's at an internal node
+            while (!cursor1.node.isLeaf()) {
+                cursor1.node = cursor1.node.children.items[0];
+                cursor1.offset = 0;
+            }
+
+            const cursor2 = cursor1.seekRight(length, 0);
+
+            var curr_node = cursor1.node;
+            var curr_offset = cursor1.offset;
+
+            // If the start cursor is at the end of the node, advance to the next leaf
+            if (curr_offset == curr_node.summary.dimensions[0]) {
+                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
+                    curr_node = next_node;
+                    curr_offset = 0;
+                } else {
+                    return cursor2;
+                }
+            }
+
+            var remaining = length;
+            const node_size = curr_node.summary.dimensions[0];
+            const available = node_size - curr_offset;
+
+            if (remaining <= available) {
+                try bucket.append(self.allocator, curr_node);
+                remaining = 0;
+            } else {
+                try bucket.append(self.allocator, curr_node);
+                remaining -= available;
+                curr_offset = 0;
+
+                // Walk up the parent chain to find right siblings
+                var curr = curr_node;
+                while (curr.parent) |p| {
+                    if (std.mem.indexOfScalar(*TreeNode, p.children.items, curr)) |idx| {
+                        if (idx + 1 < p.children.items.len) {
+                            var i = idx + 1;
+                            while (i < p.children.items.len) : (i += 1) {
+                                const sibling = p.children.items[i];
+                                const sibling_size = sibling.summary.dimensions[0];
+                                if (remaining >= sibling_size) {
+                                    // Sibling subtree is fully covered, collect it directly without descending!
+                                    try bucket.append(self.allocator, sibling);
+                                    remaining -= sibling_size;
+                                } else if (remaining > 0) {
+                                    // Boundary lies inside this sibling subtree, descend into it
+                                    curr_node = sibling;
+                                    while (!curr_node.isLeaf()) {
+                                        for (curr_node.children.items) |child| {
+                                            const child_size = child.summary.dimensions[0];
+                                            if (remaining >= child_size) {
+                                                try bucket.append(self.allocator, child);
+                                                remaining -= child_size;
+                                            } else {
+                                                curr_node = child;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (remaining > 0) {
+                                        try bucket.append(self.allocator, curr_node);
+                                        remaining = 0;
+                                    }
+                                    break;
+                                }
+                            }
+                            if (remaining == 0) break;
+                        }
+                    }
+                    curr = p;
+                }
+            }
+
+            return cursor2;
+        }
 
         /// Recomputes summaries for all nodes in the tree recursively from the root down.
         pub fn recomputeSummaries(self: *Self) !void {

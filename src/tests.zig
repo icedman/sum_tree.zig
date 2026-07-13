@@ -911,6 +911,118 @@ test "SumTree erase fuzz test" {
     }
 }
 
+test "SumTree collect range" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // Insert multiple chunks
+    _ = try tree.insert("abc", tree.createCursor());
+    _ = try tree.insert("def", tree.createCursor());
+    _ = try tree.insert("ghi", tree.createCursor());
+
+    // Total chunks: "ghidefabc"
+    // Leaves should be:
+    // Leaf 1: "ghi"
+    // Leaf 2: "def"
+    // Leaf 3: "abc"
+
+    var bucket = std.ArrayList(*S.TreeNode).empty;
+    defer bucket.deinit(allocator);
+
+    // Create cursor at start of L2 ("def") offset 1, which corresponds to index 4 ('e')
+    var cursor = tree.createCursor();
+    cursor = cursor.seekRight(4, 0);
+
+    // Collect 4 elements: starts at 'e' in "def", covers 'e', 'f' in "def", and 'a', 'b' in "abc"
+    const end_cursor = try tree.collectLeaves(cursor, 4, &bucket);
+
+    // End cursor should be at index 8 ('c'), which is in "abc" offset 2
+    try std.testing.expectEqual(@as(usize, 8), end_cursor.resolveAbsolute());
+
+    // We should have collected Leaf 2 and Leaf 3
+    try std.testing.expectEqual(@as(usize, 2), bucket.items.len);
+
+    // First collected node should be Leaf 2 containing "def"
+    const leaf2 = bucket.items[0];
+    const leaf2_slice = tree.chunks.items[leaf2.start .. leaf2.start + leaf2.summary.dimensions[0]];
+    try std.testing.expectEqualSlices(u8, "def", leaf2_slice);
+
+    // Second collected node should be Leaf 3 containing "abc"
+    const leaf3 = bucket.items[1];
+    const leaf3_slice = tree.chunks.items[leaf3.start .. leaf3.start + leaf3.summary.dimensions[0]];
+    try std.testing.expectEqualSlices(u8, "abc", leaf3_slice);
+}
+
+test "SumTree collectNodes structural range collection" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    const root = tree.root;
+
+    // Build a 3-internal-node tree:
+    // Root
+    //  ├── int1
+    //  │    ├── l1 ("abc")
+    //  │    └── l2 ("def")
+    //  ├── int2
+    //  │    ├── l3 ("ghi")
+    //  │    └── l4 ("jkl")
+    //  └── int3
+    //       ├── l5 ("mno")
+    //       └── l6 ("pqr")
+
+    const int1 = try tree.createNode(&.{});
+    const int2 = try tree.createNode(&.{});
+    const int3 = try tree.createNode(&.{});
+    try root.attach(int1);
+    try root.attach(int2);
+    try root.attach(int3);
+
+    const l1 = try tree.createNode("abc");
+    const l2 = try tree.createNode("def");
+    try int1.attach(l1);
+    try int1.attach(l2);
+
+    const l3 = try tree.createNode("ghi");
+    const l4 = try tree.createNode("jkl");
+    try int2.attach(l3);
+    try int2.attach(l4);
+
+    const l5 = try tree.createNode("mno");
+    const l6 = try tree.createNode("pqr");
+    try int3.attach(l5);
+    try int3.attach(l6);
+
+    try tree.chunks.appendSlice(allocator, "abcdefghijklmnopqr");
+
+    int1.summarize();
+    int2.summarize();
+    int3.summarize();
+    root.summarize();
+
+    var bucket = std.ArrayList(*S.TreeNode).empty;
+    defer bucket.deinit(allocator);
+
+    // Create a cursor at l2, offset 0 (which has absolute position 3)
+    const cursor = tree.createCursorAt(l2, 0);
+
+    // Collect range of length 11 (covers l2 [3 chars], int2 [6 chars], and 2 chars of l5)
+    const end_cursor = try tree.collectNodes(cursor, 11, &bucket);
+
+    // End cursor absolute position should be 3 + 11 = 14 (which is offset 2 in l5)
+    try std.testing.expectEqual(@as(usize, 14), end_cursor.resolveAbsolute());
+
+    // We should have collected exactly: l2 (leaf), int2 (internal node), l5 (leaf)
+    try std.testing.expectEqual(@as(usize, 3), bucket.items.len);
+    try std.testing.expectEqual(l2, bucket.items[0]);
+    try std.testing.expectEqual(int2, bucket.items[1]);
+    try std.testing.expectEqual(l5, bucket.items[2]);
+}
+
 pub fn visualize(tree: anytype, node: anytype) void {
     var active_paths = [_]bool{false} ** 64;
     visualizeHelper(tree, node, 0, &active_paths, true);
