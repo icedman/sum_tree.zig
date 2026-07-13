@@ -521,7 +521,7 @@ test "Node prune with contiguous sibling merging" {
 test "SumTree comprehensive history and undo test (insert, erase, split, join)" {
     const allocator = std.heap.page_allocator;
     const S = SumTree(u8);
-    
+
     // Save & set MAX_NODE_CHILDREN to 3 at runtime to trigger splits/joins easily
     const orig_max = Config.MAX_NODE_CHILDREN;
     defer Config.MAX_NODE_CHILDREN = orig_max;
@@ -562,7 +562,7 @@ test "SumTree comprehensive history and undo test (insert, erase, split, join)" 
     try std.testing.expectEqual(@as(usize, 6), tree.root.summary.dimensions[0]);
 
     // Now roll back step-by-step and verify restoration
-    
+
     // Undo erase (revert to State 4)
     try tree.undo();
     try std.testing.expectEqual(@as(usize, 12), tree.root.summary.dimensions[0]);
@@ -648,5 +648,264 @@ test "SumTree initWithChunk (unmanaged chunks)" {
     try std.testing.expectEqualSlices(u8, "hello", tree_chunks.items);
 }
 
+test "SumTree node timestamps on insert, erase, undo, redo" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
 
+    tree.enable_history = true;
 
+    const t_init = tree.root.timestamp;
+
+    // 1. Insert "abc"
+    _ = try tree.insert("abc", tree.createCursor());
+    const t_insert = tree.timestamp;
+    try std.testing.expect(t_insert > t_init);
+    try std.testing.expectEqual(t_insert, tree.root.timestamp);
+
+    // 2. Insert "def" - should trigger another update and touch the affected nodes
+    _ = try tree.insert("def", tree.createCursor());
+    const t_insert2 = tree.timestamp;
+    try std.testing.expect(t_insert2 > t_insert);
+    try std.testing.expectEqual(t_insert2, tree.root.timestamp);
+
+    // 3. Erase part of the tree
+    var cursor = tree.createCursor();
+    cursor = cursor.seekRight(1, 0);
+    _ = try tree.erase(cursor, 2);
+    const t_erase = tree.timestamp;
+    try std.testing.expect(t_erase > t_insert2);
+    try std.testing.expectEqual(t_erase, tree.root.timestamp);
+
+    // 4. Undo the erase - should restore the previous timestamp (t_insert2)
+    try tree.undo();
+    try std.testing.expectEqual(t_insert2, tree.root.timestamp);
+
+    // 5. Redo the erase - should restore the erase timestamp (t_erase)
+    try tree.redo();
+    try std.testing.expectEqual(t_erase, tree.root.timestamp);
+}
+
+fn testSummarizer(slice: []const u8) st.Summary {
+    var sum = st.Summary{};
+    sum.dimensions[0] = slice.len;
+    for (slice) |item| {
+        if (item == 'o') {
+            sum.dimensions[1] += 1;
+        }
+    }
+    return sum;
+}
+
+test "SumTree recomputeSummaries" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    tree.summarize = testSummarizer;
+    tree.enable_history = true;
+
+    // Insert some items
+    _ = try tree.insert("hello", tree.createCursor());
+    _ = try tree.insert("world", tree.createCursor());
+
+    try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(@as(usize, 2), tree.root.summary.dimensions[1]);
+
+    // Corrupt root summary and a leaf summary in dimension 1
+    tree.root.summary.dimensions[1] = 999;
+
+    // Find a leaf and corrupt it
+    var leaf = tree.root;
+    while (!leaf.isLeaf()) {
+        leaf = leaf.children.items[0];
+    }
+    leaf.summary.dimensions[1] = 123;
+
+    // Recompute summaries
+    try tree.recomputeSummaries();
+
+    // Verify it is restored to correct value (2)
+    try std.testing.expectEqual(@as(usize, 2), tree.root.summary.dimensions[1]);
+
+    // Undo should restore the corrupted state
+    try tree.undo();
+    try std.testing.expectEqual(@as(usize, 999), tree.root.summary.dimensions[1]);
+
+    // Redo should restore the recomputed correct state
+    try tree.redo();
+    try std.testing.expectEqual(@as(usize, 2), tree.root.summary.dimensions[1]);
+}
+
+test "SumTree snapshot" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+
+    // Create source tree
+    const source_tree = try S.init(allocator);
+    defer source_tree.deinit();
+
+    // Create snapshot tree
+    const snap_tree = try S.init(allocator);
+    defer snap_tree.deinit();
+
+    // Populate source tree
+    _ = try source_tree.insert("hello", source_tree.createCursor());
+    _ = try source_tree.insert("world", source_tree.createCursor());
+
+    // Take snapshot - should return true (changed)
+    const changed1 = try snap_tree.snapshot(source_tree);
+    try std.testing.expect(changed1);
+
+    // Verify snapshot state matches source
+    try std.testing.expectEqual(source_tree.root.summary.dimensions[0], snap_tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(source_tree.nodes.items.len, snap_tree.nodes.items.len);
+    try std.testing.expectEqualSlices(u8, source_tree.chunks.items, snap_tree.chunks.items);
+
+    // Take snapshot again without modifications - should return false (not changed)
+    const changed2 = try snap_tree.snapshot(source_tree);
+    try std.testing.expect(!changed2);
+
+    // Modify source tree
+    _ = try source_tree.insert("!", source_tree.createCursor());
+
+    // Take snapshot again - should return true (changed) and match
+    const changed3 = try snap_tree.snapshot(source_tree);
+    try std.testing.expect(changed3);
+    try std.testing.expectEqual(source_tree.root.summary.dimensions[0], snap_tree.root.summary.dimensions[0]);
+    try std.testing.expectEqualSlices(u8, source_tree.chunks.items, snap_tree.chunks.items);
+}
+
+test "SumTree collect" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // Insert multiple chunks
+    _ = try tree.insert("abc", tree.createCursor());
+    _ = try tree.insert("def", tree.createCursor());
+    _ = try tree.insert("ghi", tree.createCursor());
+
+    // Total chunks: "ghidefabc"
+    // Leaves should be:
+    // Leaf 1: "ghi"
+    // Leaf 2: "def"
+    // Leaf 3: "abc"
+
+    var bucket = std.ArrayList(*S.TreeNode).empty;
+    defer bucket.deinit(allocator);
+
+    // Let's seek to Leaf 2 ("def") offset 1, which corresponds to index 4 ('e')
+    var cursor = tree.createCursor();
+    cursor = cursor.seekRight(4, 0);
+
+    // Collect 4 elements: starts at 'e' in "def", covers 'e', 'f' in "def", and 'a', 'b' in "abc"
+    const end_cursor = try tree.collect(cursor, 4, &bucket);
+
+    // End cursor should be at index 8 ('c'), which is in "abc" offset 2
+    try std.testing.expectEqual(@as(usize, 8), end_cursor.resolveAbsolute());
+
+    // We should have collected Leaf 2 and Leaf 3
+    try std.testing.expectEqual(@as(usize, 2), bucket.items.len);
+
+    // First collected node should be Leaf 2 containing "def"
+    const leaf2 = bucket.items[0];
+    const leaf2_slice = tree.chunks.items[leaf2.start .. leaf2.start + leaf2.summary.dimensions[0]];
+    try std.testing.expectEqualSlices(u8, "def", leaf2_slice);
+
+    // Second collected node should be Leaf 3 containing "abc"
+    const leaf3 = bucket.items[1];
+    const leaf3_slice = tree.chunks.items[leaf3.start .. leaf3.start + leaf3.summary.dimensions[0]];
+    try std.testing.expectEqualSlices(u8, "abc", leaf3_slice);
+}
+
+test "SumTree collectUntil" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // Insert multiple chunks
+    _ = try tree.insert("abc", tree.createCursor());
+    _ = try tree.insert("def", tree.createCursor());
+    _ = try tree.insert("ghi", tree.createCursor());
+
+    // Total chunks: "ghidefabc"
+    // Leaves should be:
+    // Leaf 1: "ghi"
+    // Leaf 2: "def"
+    // Leaf 3: "abc"
+
+    var bucket = std.ArrayList(*S.TreeNode).empty;
+    defer bucket.deinit(allocator);
+
+    // Let's seek to Leaf 2 ("def") offset 1, which corresponds to index 4 ('e')
+    var cursor = tree.createCursor();
+    cursor = cursor.seekRight(4, 0);
+
+    const Helper = struct {
+        pub fn match(cur: S.TreeCursor) bool {
+            return cur.resolveAbsolute() >= 8;
+        }
+    };
+
+    // Collect until absolute position is 8
+    const end_cursor = try tree.collectUntil(cursor, Helper.match, &bucket);
+
+    // End cursor absolute position should be 8
+    try std.testing.expectEqual(@as(usize, 8), end_cursor.resolveAbsolute());
+
+    // We should have collected Leaf 2 and Leaf 3, with duplicates
+    try std.testing.expectEqual(@as(usize, 4), bucket.items.len);
+
+    // First collected node should be Leaf 2 containing "def"
+    const leaf2 = bucket.items[0];
+    const leaf2_slice = tree.chunks.items[leaf2.start .. leaf2.start + leaf2.summary.dimensions[0]];
+    try std.testing.expectEqualSlices(u8, "def", leaf2_slice);
+
+    // Second collected node should be Leaf 2 containing "def"
+    const leaf2b = bucket.items[1];
+    try std.testing.expectEqual(leaf2, leaf2b);
+
+    // Third collected node should be Leaf 3 containing "abc"
+    const leaf3 = bucket.items[2];
+    const leaf3_slice = tree.chunks.items[leaf3.start .. leaf3.start + leaf3.summary.dimensions[0]];
+    try std.testing.expectEqualSlices(u8, "abc", leaf3_slice);
+
+    // Fourth collected node should be Leaf 3 containing "abc"
+    const leaf3b = bucket.items[3];
+    try std.testing.expectEqual(leaf3, leaf3b);
+}
+
+test "SumTree Iterator" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // Insert multiple chunks
+    _ = try tree.insert("abc", tree.createCursor());
+    _ = try tree.insert("def", tree.createCursor());
+    _ = try tree.insert("ghi", tree.createCursor());
+
+    // Total chunks: "ghidefabc"
+    var it = tree.iterator();
+
+    const chunk1 = it.next();
+    try std.testing.expect(chunk1 != null);
+    try std.testing.expectEqualSlices(u8, "ghi", chunk1.?);
+
+    const chunk2 = it.next();
+    try std.testing.expect(chunk2 != null);
+    try std.testing.expectEqualSlices(u8, "def", chunk2.?);
+
+    const chunk3 = it.next();
+    try std.testing.expect(chunk3 != null);
+    try std.testing.expectEqualSlices(u8, "abc", chunk3.?);
+
+    const chunk4 = it.next();
+    try std.testing.expect(chunk4 == null);
+}

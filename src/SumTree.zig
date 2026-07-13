@@ -31,20 +31,20 @@ fn Node(comptime ValueT: type) type {
 
         const Clone = struct {
             allocator: Allocator,
-            id: usize = 0,    
-            parent_id: ?usize = null,    
+            id: usize = 0,
+            parent_id: ?usize = null,
             start: usize = 0,
             children: ArrayList(usize),
             summary: Summary = .{},
-
             timestamp: i64 = 0,
+            node_timestamp: i64 = 0,
 
             pub fn init(allocator: Allocator) !*Clone {
                 const clone = try allocator.create(Clone);
                 clone.* = Clone{
                     .allocator = allocator,
                     .parent_id = null,
-                    .children = try ArrayList(usize).initCapacity(allocator, MAX_CHILDREN),
+                    .children = ArrayList(usize).empty,
                 };
                 return clone;
             }
@@ -66,13 +66,15 @@ fn Node(comptime ValueT: type) type {
         children: ArrayList(*Self),
         summary: Summary = .{},
 
+        timestamp: i64 = 0,
+
         /// Constructor: Allocates memory for a Node and initializes its children array list.
         pub fn init(allocator: Allocator) !*Self {
             const node = try allocator.create(Self);
             node.* = Self{
                 .allocator = allocator,
                 .parent_id = null,
-                .children = try ArrayList(*Self).initCapacity(allocator, MAX_CHILDREN),
+                .children = ArrayList(*Self).empty,
             };
             return node;
         }
@@ -151,6 +153,10 @@ fn Node(comptime ValueT: type) type {
                 try tree.cloneNode(self);
                 self.summarize();
             }
+        }
+
+        pub fn touch(self: *Self, timestamp: i64) void {
+            self.timestamp = timestamp;
         }
     };
 }
@@ -340,10 +346,12 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
 pub fn SumTree(comptime ValueT: type) type {
     return struct {
         const Self = @This();
-        const TreeNode = Node(ValueT);
-        const TreeCursor = Cursor(Self, TreeNode);
-        const TreeChunk = ArrayList(ValueT);
-        const Summarizer = *const fn ([]const ValueT) Summary;
+
+        pub const TreeNode = Node(ValueT);
+        pub const TreeCursor = Cursor(Self, TreeNode);
+        pub const TreeChunk = ArrayList(ValueT);
+        pub const Summarizer = *const fn ([]const ValueT) Summary;
+        pub const CollectComparator = *const fn (TreeCursor) bool;
 
         enable_history: bool = false,
 
@@ -371,20 +379,15 @@ pub fn SumTree(comptime ValueT: type) type {
         pub fn init(allocator: Allocator) !*Self {
             const tree = try allocator.create(Self);
             errdefer allocator.destroy(tree);
-            
+
             const chunks_ptr = try allocator.create(TreeChunk);
             errdefer allocator.destroy(chunks_ptr);
             chunks_ptr.* = try TreeChunk.initCapacity(allocator, 32);
             errdefer chunks_ptr.deinit(allocator);
 
-            tree.nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32);
-            errdefer tree.nodes.deinit(allocator);
-
-            tree.clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
-            errdefer tree.clones.deinit(allocator);
-
-            tree.redo_clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
-            errdefer tree.redo_clones.deinit(allocator);
+            tree.nodes = ArrayList(*TreeNode).empty;
+            tree.clones = ArrayList(*TreeNode.Clone).empty;
+            tree.redo_clones = ArrayList(*TreeNode.Clone).empty;
 
             tree.allocator = allocator;
             tree.chunks = chunks_ptr;
@@ -394,22 +397,19 @@ pub fn SumTree(comptime ValueT: type) type {
             tree.summarize = defaultSummarizer;
             tree.root = undefined;
 
+            tree.updateTimestamp();
             tree.root = try tree.createNode(&.{});
+
             return tree;
         }
-        
+
         pub fn initWithChunk(allocator: Allocator, tree_chunks: *TreeChunk) !*Self {
             const tree = try allocator.create(Self);
             errdefer allocator.destroy(tree);
-            
-            tree.nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32);
-            errdefer tree.nodes.deinit(allocator);
 
-            tree.clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
-            errdefer tree.clones.deinit(allocator);
-
-            tree.redo_clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
-            errdefer tree.redo_clones.deinit(allocator);
+            tree.nodes = ArrayList(*TreeNode).empty;
+            tree.clones = ArrayList(*TreeNode.Clone).empty;
+            tree.redo_clones = ArrayList(*TreeNode.Clone).empty;
 
             tree.allocator = allocator;
             tree.chunks = tree_chunks;
@@ -419,10 +419,10 @@ pub fn SumTree(comptime ValueT: type) type {
             tree.summarize = defaultSummarizer;
             tree.root = undefined;
 
+            tree.updateTimestamp();
             tree.root = try tree.createNode(&.{});
             return tree;
         }
-
 
         /// Destructor: Destroys all allocated nodes and backing lists.
         pub fn deinit(self: *Self) void {
@@ -454,6 +454,7 @@ pub fn SumTree(comptime ValueT: type) type {
             node.id = self.nodes.items.len - 1;
             node.start = self.chunks.items.len;
             node.summary = self.summarize(chunk);
+            node.touch(self.timestamp);
             return node;
         }
 
@@ -539,20 +540,21 @@ pub fn SumTree(comptime ValueT: type) type {
         }
 
         fn cloneNode(self: *Self, target_node: *TreeNode) !void {
-            if (!self.enable_history) {
-                return;
+            if (self.enable_history) {
+                const clone = try TreeNode.Clone.init(self.allocator);
+                try self.clones.append(self.allocator, clone);
+                clone.id = target_node.id;
+                clone.parent_id = target_node.parent_id;
+                clone.start = target_node.start;
+                clone.summary = target_node.summary;
+                for (target_node.children.items) |item| {
+                    try clone.children.append(self.allocator, item.id);
+                }
+                clone.timestamp = self.timestamp;
+                clone.node_timestamp = target_node.timestamp;
             }
 
-            const clone = try TreeNode.Clone.init(self.allocator);
-            try self.clones.append(self.allocator, clone);
-            clone.id = target_node.id;
-            clone.parent_id = target_node.parent_id;
-            clone.start = target_node.start;
-            clone.summary = target_node.summary;
-            for (target_node.children.items) |item| {
-                try clone.children.append(self.allocator, item.id);
-            }
-            clone.timestamp = self.timestamp;
+            target_node.touch(self.timestamp);
         }
 
         fn collapseSingleChildNodes(self: *Self, target_node: *TreeNode) anyerror!void {
@@ -1003,6 +1005,28 @@ pub fn SumTree(comptime ValueT: type) type {
             return c;
         }
 
+        /// Recomputes summaries for all nodes in the tree recursively from the root down.
+        pub fn recomputeSummaries(self: *Self) !void {
+            self.clearRedoHistory();
+            self.updateTimestamp();
+            try self.recomputeSummariesHelper(self.root);
+        }
+
+        fn recomputeSummariesHelper(self: *Self, node: *TreeNode) anyerror!void {
+            try self.cloneNode(node);
+
+            if (node.isLeaf()) {
+                const len = node.summary.dimensions[0];
+                const slice = self.chunks.items[node.start .. node.start + len];
+                node.summary = self.summarize(slice);
+            } else {
+                for (node.children.items) |child| {
+                    try self.recomputeSummariesHelper(child);
+                }
+                node.summarize();
+            }
+        }
+
         pub fn clearRedoHistory(self: *Self) void {
             while (self.redo_clones.pop()) |c| {
                 c.deinit();
@@ -1037,6 +1061,7 @@ pub fn SumTree(comptime ValueT: type) type {
                     try redo_clone.children.append(self.allocator, child.id);
                 }
                 redo_clone.timestamp = clone.timestamp;
+                redo_clone.node_timestamp = shadow.timestamp;
 
                 // 2. Revert active node to the undone state
                 if (clone.parent_id) |p_id| {
@@ -1049,6 +1074,7 @@ pub fn SumTree(comptime ValueT: type) type {
 
                 shadow.start = clone.start;
                 shadow.summary = clone.summary;
+                shadow.timestamp = clone.node_timestamp;
                 shadow.children.clearRetainingCapacity();
 
                 for (clone.children.items) |item| {
@@ -1103,6 +1129,7 @@ pub fn SumTree(comptime ValueT: type) type {
                     try undo_clone.children.append(self.allocator, child.id);
                 }
                 undo_clone.timestamp = clone.timestamp;
+                undo_clone.node_timestamp = shadow.timestamp;
 
                 // 2. Re-apply the redone state
                 if (clone.parent_id) |p_id| {
@@ -1115,6 +1142,7 @@ pub fn SumTree(comptime ValueT: type) type {
 
                 shadow.start = clone.start;
                 shadow.summary = clone.summary;
+                shadow.timestamp = clone.node_timestamp;
                 shadow.children.clearRetainingCapacity();
 
                 for (clone.children.items) |item| {
@@ -1260,6 +1288,205 @@ pub fn SumTree(comptime ValueT: type) type {
                 const child_is_last = (idx == children_count - 1);
                 try self.visualizeHelperWrite(child, depth + 1, active_paths, child_is_last, writer);
             }
+        }
+
+        /// Collects nodes with a range of the give cursor and length
+        ///
+        pub fn collect(self: *Self, cursor: TreeCursor, length: usize, bucket: *ArrayList(*TreeNode)) !TreeCursor {
+            _ = self;
+            if (length == 0) {
+                var c = cursor;
+                c.absolute = c.resolveAbsolute();
+                return c.seekRight(0, 0);
+            }
+
+            var cur = cursor;
+            cur.absolute = cur.resolveAbsolute();
+            const target_cursor = cur.seekRight(0, 0);
+
+            var curr_node = target_cursor.node;
+            var curr_offset = target_cursor.offset;
+            var remaining = length;
+
+            // Normalize starting offset: if curr_offset is at the end of the node, try to move to the next leaf
+            const L = curr_node.summary.dimensions[0];
+            if (curr_offset == L) {
+                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
+                    curr_node = next_node;
+                    curr_offset = 0;
+                } else {
+                    var end_cur = TreeCursor{
+                        .tree = cursor.tree,
+                        .node = curr_node,
+                        .offset = curr_offset,
+                        .absolute = 0,
+                    };
+                    end_cur.absolute = end_cur.resolveAbsolute();
+                    return end_cur;
+                }
+            }
+
+            // Loop across nodes to collect them
+            while (remaining > 0) {
+                const node_size = curr_node.summary.dimensions[0];
+                const available = node_size - curr_offset;
+                const consumed = @min(remaining, available);
+
+                try bucket.append(cursor.tree.allocator, curr_node);
+
+                remaining -= consumed;
+                curr_offset += consumed;
+
+                if (remaining > 0) {
+                    if (TreeCursor.nextLeaf(curr_node)) |next_node| {
+                        curr_node = next_node;
+                        curr_offset = 0;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            var end_cur = TreeCursor{
+                .tree = cursor.tree,
+                .node = curr_node,
+                .offset = curr_offset,
+                .absolute = 0,
+            };
+            end_cur.absolute = end_cur.resolveAbsolute();
+            return end_cur;
+        }
+
+        pub fn collectUntil(
+            self: *Self,
+            cursor: TreeCursor,
+            comparator: CollectComparator,
+            bucket: *ArrayList(*TreeNode),
+        ) !TreeCursor {
+            var curr_cursor = cursor;
+            curr_cursor.absolute = curr_cursor.resolveAbsolute();
+
+            while (true) {
+                const prev_absolute = curr_cursor.absolute;
+                const next_cursor = try self.collect(curr_cursor, 1, bucket);
+                if (next_cursor.absolute == prev_absolute) {
+                    break;
+                }
+                curr_cursor = next_cursor;
+                if (comparator(curr_cursor)) {
+                    break;
+                }
+            }
+            return curr_cursor;
+        }
+
+        /// Create or update a snapshot of the tree
+        /// Clone tree to self
+        pub fn snapshot(self: *Self, tree: *Self) !bool {
+            var changed = false;
+
+            // 1. Create the same number of nodes - add nodes to self if children count is less than tree children
+            if (self.nodes.items.len < tree.nodes.items.len) {
+                changed = true;
+                try self.nodes.ensureTotalCapacity(self.allocator, tree.nodes.items.len);
+                while (self.nodes.items.len < tree.nodes.items.len) {
+                    const node = try TreeNode.init(self.allocator);
+                    try self.nodes.append(self.allocator, node);
+                    node.id = self.nodes.items.len - 1;
+                }
+            } else if (self.nodes.items.len > tree.nodes.items.len) {
+                changed = true;
+                while (self.nodes.items.len > tree.nodes.items.len) {
+                    const node = self.nodes.pop().?;
+                    node.deinit();
+                    self.allocator.destroy(node);
+                }
+            }
+
+            // 2. Loop through the nodes array of each and compare timestamp
+            for (0..tree.nodes.items.len) |i| {
+                const tree_node = tree.nodes.items[i];
+                const self_node = self.nodes.items[i];
+
+                // 3. If timestamps are not the same, copy - summary from tree and rebuild children and parent based
+                //    on tree.children ids
+                if (self_node.timestamp != tree_node.timestamp) {
+                    changed = true;
+                    self_node.start = tree_node.start;
+                    self_node.summary = tree_node.summary;
+                    self_node.timestamp = tree_node.timestamp;
+                    self_node.parent_id = tree_node.parent_id;
+
+                    self_node.children.clearRetainingCapacity();
+                    for (tree_node.children.items) |child| {
+                        try self_node.children.append(self.allocator, self.nodes.items[child.id]);
+                    }
+                }
+            }
+
+            // Rebuild parent pointers for all nodes to ensure consistency
+            // for (0..tree.nodes.items.len) |i| {
+            //     const tree_node = tree.nodes.items[i];
+            //     const self_node = self.nodes.items[i];
+            //     if (tree_node.parent_id) |p_id| {
+            //         self_node.parent = self.nodes.items[p_id];
+            //         self_node.parent_id = p_id;
+            //     } else {
+            //         self_node.parent = null;
+            //         self_node.parent_id = null;
+            //     }
+            // }
+
+            // Sync tree root and tree timestamp
+            const target_root = self.nodes.items[tree.root.id];
+            if (self.root != target_root) {
+                self.root = target_root;
+                changed = true;
+            }
+
+            if (self.timestamp != tree.timestamp) {
+                self.timestamp = tree.timestamp;
+                changed = true;
+            }
+
+            // Sync chunks array if snapshot manages its own chunks
+            // Otherwise, it is assumed snapshot points to the same TreeChunks
+            if (self.managed_chunks) {
+                if (!std.mem.eql(ValueT, self.chunks.items, tree.chunks.items)) {
+                    self.chunks.clearRetainingCapacity();
+                    try self.chunks.appendSlice(self.allocator, tree.chunks.items);
+                    changed = true;
+                }
+            }
+
+            return changed;
+        }
+
+        pub const Iterator = struct {
+            tree: *Self,
+            curr_node: ?*TreeNode,
+
+            pub fn next(self: *Iterator) ?[]const ValueT {
+                while (self.curr_node) |node| {
+                    const len = node.summary.dimensions[0];
+                    self.curr_node = TreeCursor.nextLeaf(node);
+                    if (len > 0) {
+                        return self.tree.chunks.items[node.start .. node.start + len];
+                    }
+                }
+                return null;
+            }
+        };
+
+        pub fn iterator(self: *Self) Iterator {
+            var curr = self.root;
+            while (!curr.isLeaf()) {
+                curr = curr.children.items[0];
+            }
+            return Iterator{
+                .tree = self,
+                .curr_node = curr,
+            };
         }
     };
 }
