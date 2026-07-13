@@ -931,7 +931,7 @@ test "Node depth" {
     try std.testing.expectEqual(@as(usize, 1), child2.depth());
 }
 
-test "SumTree erase_v2 vs erase comparison fuzz test" {
+test "SumTree erase fuzz test" {
     const allocator = std.heap.page_allocator;
     const S = SumTree(u8);
     
@@ -976,7 +976,7 @@ test "SumTree erase_v2 vs erase comparison fuzz test" {
 
         // Erase using v2
         const cur2 = tree_v2.createCursor().seekRight(pos, 0);
-        const res_cur2 = try tree_v2.erase_v2(cur2, len);
+        const res_cur2 = try tree_v2.erase(cur2, len);
 
         // Verify summary and cursor consistency in this step
         try std.testing.expectEqual(tree_v1.root.summary.dimensions[0], tree_v2.root.summary.dimensions[0]);
@@ -994,5 +994,105 @@ test "SumTree erase_v2 vs erase comparison fuzz test" {
             }
             try std.testing.expectEqualSlices(u8, c1.?, c2.?);
         }
+    }
+}
+
+pub fn visualize(tree: anytype, node: anytype) void {
+    var active_paths = [_]bool{false} ** 64;
+    visualizeHelper(tree, node, 0, &active_paths, true);
+}
+
+fn visualizeHelper(tree: anytype, node: anytype, depth: usize, active_paths: *[64]bool, is_last: bool) void {
+    if (depth > 0) {
+        for (0..depth - 1) |i| {
+            if (active_paths[i]) {
+                std.debug.print("│   ", .{});
+            } else {
+                std.debug.print("    ", .{});
+            }
+        }
+        if (is_last) {
+            std.debug.print("└── ", .{});
+        } else {
+            std.debug.print("├── ", .{});
+        }
+    }
+
+    std.debug.print("node {}: ", .{node.id});
+
+    if (node.isLeaf()) {
+        const len = node.summary.dimensions[0];
+        if (len > 0) {
+            const slice = tree.chunks.items[node.start..(node.start + len)];
+            if (slice.len > 10) {
+                std.debug.print("\"{s}...{s}\"\n", .{ slice[0..3], slice[slice.len - 3 ..] });
+            } else {
+                std.debug.print("\"{s}\"\n", .{slice});
+            }
+        } else {
+            std.debug.print("\"\"\n", .{});
+        }
+    } else {
+        std.debug.print("\n", .{});
+    }
+
+    if (depth < 64) {
+        active_paths[depth] = !is_last;
+    }
+
+    const children_count = node.children.items.len;
+    for (node.children.items, 0..) |child, idx| {
+        const child_is_last = (idx == children_count - 1);
+        visualizeHelper(tree, child, depth + 1, active_paths, child_is_last);
+    }
+}
+
+pub fn visualizeWrite(tree: anytype, node: anytype, writer: anytype) anyerror!void {
+    var active_paths = [_]bool{false} ** 64;
+    try visualizeHelperWrite(tree, node, 0, &active_paths, true, writer);
+}
+
+fn visualizeHelperWrite(tree: anytype, node: anytype, depth: usize, active_paths: *[64]bool, is_last: bool, writer: anytype) anyerror!void {
+    if (depth > 0) {
+        for (0..depth - 1) |i| {
+            if (active_paths[i]) {
+                try writer.print("│   ", .{});
+            } else {
+                try writer.print("    ", .{});
+            }
+        }
+        if (is_last) {
+            try writer.print("└── ", .{});
+        } else {
+            try writer.print("├── ", .{});
+        }
+    }
+
+    try writer.print("node {}: ", .{node.id});
+
+    if (node.isLeaf()) {
+        const len = node.summary.dimensions[0];
+        if (len > 0) {
+            const slice = tree.chunks.items[node.start..(node.start + len)];
+            if (slice.len > 10) {
+                try writer.print("\"{s}...{s}\"\n", .{ slice[0..3], slice[slice.len - 3 ..] });
+            } else {
+                try writer.print("\"{s}\"\n", .{slice});
+            }
+        } else {
+            try writer.print("\"\"\n", .{});
+        }
+    } else {
+        try writer.print("\n", .{});
+    }
+
+    if (depth < 64) {
+        active_paths[depth] = !is_last;
+    }
+
+    const children_count = node.children.items.len;
+    for (node.children.items, 0..) |child, idx| {
+        const child_is_last = (idx == children_count - 1);
+        try visualizeHelperWrite(tree, child, depth + 1, active_paths, child_is_last, writer);
     }
 }

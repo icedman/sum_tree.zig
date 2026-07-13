@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const sum_tree = @import("sum_tree");
+const tests = sum_tree.tests;
 const st = sum_tree.SumTree;
 const SumTree = st.SumTree;
 const Dimensions = st.Dimensions;
@@ -57,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     var file_writer: Io.File.Writer = .init(file, io, &file_buffer);
     const writer = &file_writer.interface;
 
-    try tree.visualizeWrite(tree.root, writer);
+    try tests.visualizeWrite(tree, tree.root, writer);
     try writer.flush();
 
     std.debug.print("Successfully ran 2000 words test and visualized to output.txt\n", .{});

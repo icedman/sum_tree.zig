@@ -895,133 +895,7 @@ pub fn SumTree(comptime ValueT: type) type {
             return c;
         }
 
-        /// B+ tree range deletion (erase) algorithm:
-        /// Seeks cursor, splits first node if offset is in the middle, and loops forward
-        /// zeroing out fully deleted leaves (dimensions[0] = 0) or truncating the start of partially deleted leaves.
-        /// Balances and prunes/joins the tree structure on completion.
         pub fn erase(self: *Self, cursor_: TreeCursor, length: usize) !TreeCursor {
-            self.clearRedoHistory();
-            self.updateTimestamp();
-
-            var cursor = cursor_;
-            cursor.absolute = cursor.resolveAbsolute();
-
-            const target_cursor = cursor.seekRight(0, 0);
-            var curr_node = target_cursor.node;
-            var curr_offset = target_cursor.offset;
-            var remaining = length;
-
-            var affected_parents = ArrayList(*TreeNode).empty;
-            defer affected_parents.deinit(self.allocator);
-
-            // Normalize start of erase by splitting leaf if offset is in the middle
-            const L = curr_node.summary.dimensions[0];
-            if (curr_offset == L) {
-                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                    curr_node = next_node;
-                    curr_offset = 0;
-                } else {
-                    return cursor;
-                }
-            } else if (curr_offset > 0 and curr_offset < L) {
-                curr_node = try self.splitLeafNode(curr_node, curr_offset);
-                curr_offset = 0;
-            }
-
-            // Loop across nodes to erase the range
-            while (remaining > 0) {
-                const node_size = curr_node.summary.dimensions[0];
-                if (remaining >= node_size) {
-                    // Full erase: zero out summary, record affected parent, bubble up summary updates
-                    try self.cloneNode(curr_node);
-                    curr_node.summary = .{};
-
-                    if (curr_node.parent) |p| {
-                        var found = false;
-                        for (affected_parents.items) |item| {
-                            if (item == p) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            try affected_parents.append(self.allocator, p);
-                        }
-                    }
-
-                    var curr_parent = curr_node.parent;
-                    while (curr_parent) |p| {
-                        try self.cloneNode(p);
-                        p.summarize();
-                        curr_parent = p.parent;
-                    }
-
-                    remaining -= node_size;
-                    if (remaining > 0) {
-                        if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                            curr_node = next_node;
-                        } else {
-                            break;
-                        }
-                    }
-                } else {
-                    // Partial erase: truncate start offset, re-summarize, bubble up updates
-                    try self.cloneNode(curr_node);
-                    curr_node.start += remaining;
-                    curr_node.summary = self.summarize(self.chunks.items[curr_node.start..(curr_node.start + node_size - remaining)]);
-
-                    var curr_parent = curr_node.parent;
-                    while (curr_parent) |p| {
-                        try self.cloneNode(p);
-                        p.summarize();
-                        curr_parent = p.parent;
-                    }
-
-                    remaining = 0;
-                }
-            }
-
-            var c = TreeCursor{
-                .tree = self,
-                .node = curr_node,
-                .offset = 0,
-                .absolute = 0,
-            };
-            c.absolute = c.resolveAbsolute();
-
-            // Prune zero-length nodes recursively from the root down
-            try self.root.prune(self);
-
-            // Join sibling nodes recursively
-            for (affected_parents.items) |parent| {
-                if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, parent) != null) {
-                    try self.joinInternalNodes(parent);
-                }
-            }
-
-            // Collapse redundant single-child internal nodes recursively
-            var dummy_last_node: ?*TreeNode = null;
-            var dummy_last_offset: usize = 0;
-            try self.collapseSingleChildNodes(self.root, &dummy_last_node, &dummy_last_offset);
-
-            var is_detached = true;
-            if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, curr_node) != null) {
-                is_detached = false;
-                if (curr_node.parent) |p| {
-                    if (std.mem.indexOfScalar(*TreeNode, p.children.items, curr_node) == null) {
-                        is_detached = true;
-                    }
-                } else if (curr_node != self.root) {
-                    is_detached = true;
-                }
-            }
-            if (is_detached) {
-                c.recalculate();
-            }
-            return c;
-        }
-
-        pub fn erase_v2(self: *Self, cursor_: TreeCursor, length: usize) !TreeCursor {
             if (length == 0) {
                 var cursor = cursor_;
                 cursor.absolute = cursor.resolveAbsolute();
@@ -1066,29 +940,32 @@ pub fn SumTree(comptime ValueT: type) type {
 
             // Case 1: Deletion is entirely within a single leaf node
             if (first_node == last_node) {
-                const N = first_node;
-                const L = N.summary.dimensions[0];
+                var target_N = first_node;
+                const L = target_N.summary.dimensions[0];
                 if (first_offset == 0 and last_offset == L) {
-                    try self.cloneNode(N);
-                    N.summary = .{};
+                    try self.cloneNode(target_N);
+                    target_N.summary = .{};
                 } else if (first_offset == 0) {
-                    try self.cloneNode(N);
-                    N.start += length;
-                    N.summary = self.summarize(self.chunks.items[N.start .. N.start + L - length]);
+                    try self.cloneNode(target_N);
+                    target_N.start += length;
+                    target_N.summary = self.summarize(self.chunks.items[target_N.start .. target_N.start + L - length]);
                 } else if (last_offset == L) {
-                    try self.cloneNode(N);
-                    N.summary = self.summarize(self.chunks.items[N.start .. N.start + first_offset]);
+                    try self.cloneNode(target_N);
+                    target_N.summary = self.summarize(self.chunks.items[target_N.start .. target_N.start + first_offset]);
                 } else {
                     // Middle delete within a single node
-                    const right_node = try self.splitLeafNode(N, last_offset);
+                    const right_node = try self.splitLeafNode(target_N, last_offset);
                     _ = right_node;
-                    const middle_node = try self.splitLeafNode(N, first_offset);
+                    if (target_N == self.root) {
+                        target_N = self.root.children.items[0];
+                    }
+                    const middle_node = try self.splitLeafNode(target_N, first_offset);
                     try self.cloneNode(middle_node);
                     middle_node.summary = .{};
                 }
 
                 // Bubble up updates
-                var curr_parent = N.parent;
+                var curr_parent = target_N.parent;
                 while (curr_parent) |p| {
                     try self.cloneNode(p);
                     p.summarize();
@@ -1104,6 +981,12 @@ pub fn SumTree(comptime ValueT: type) type {
                 // Return end cursor
                 const target_end_cursor2 = self.createCursorAt(null, 0).seekRight(cursor.absolute, 0);
                 var c = target_end_cursor2;
+                if (c.offset == c.node.summary.dimensions[0]) {
+                    if (TreeCursor.nextLeaf(c.node)) |next_node| {
+                        c.node = next_node;
+                        c.offset = 0;
+                    }
+                }
                 c.absolute = c.resolveAbsolute();
                 return c;
             }
@@ -1141,6 +1024,12 @@ pub fn SumTree(comptime ValueT: type) type {
                     try self.collapseSingleChildNodes(self.root, &dummy_last_node, &dummy_last_offset);
                     const target_end_cursor2 = self.createCursorAt(null, 0).seekRight(cursor.absolute, 0);
                     var c = target_end_cursor2;
+                    if (c.offset == c.node.summary.dimensions[0]) {
+                        if (TreeCursor.nextLeaf(c.node)) |next_node| {
+                            c.node = next_node;
+                            c.offset = 0;
+                        }
+                    }
                     c.absolute = c.resolveAbsolute();
                     return c;
                 }
@@ -1535,105 +1424,7 @@ pub fn SumTree(comptime ValueT: type) type {
             }
         }
 
-        pub fn visualize(self: Self, node: *TreeNode) void {
-            var active_paths = [_]bool{false} ** 64;
-            self.visualizeHelper(node, 0, &active_paths, true);
-        }
 
-        fn visualizeHelper(self: Self, node: *TreeNode, depth: usize, active_paths: *[64]bool, is_last: bool) void {
-            if (depth > 0) {
-                for (0..depth - 1) |i| {
-                    if (active_paths[i]) {
-                        std.debug.print("│   ", .{});
-                    } else {
-                        std.debug.print("    ", .{});
-                    }
-                }
-                if (is_last) {
-                    std.debug.print("└── ", .{});
-                } else {
-                    std.debug.print("├── ", .{});
-                }
-            }
-
-            std.debug.print("node {}: ", .{node.id});
-
-            if (node.isLeaf()) {
-                const len = node.summary.dimensions[0];
-                if (len > 0) {
-                    const slice = self.chunks.items[node.start..(node.start + len)];
-                    if (slice.len > 10) {
-                        std.debug.print("\"{s}...{s}\"\n", .{ slice[0..3], slice[slice.len - 3 ..] });
-                    } else {
-                        std.debug.print("\"{s}\"\n", .{slice});
-                    }
-                } else {
-                    std.debug.print("\"\"\n", .{});
-                }
-            } else {
-                std.debug.print("\n", .{});
-            }
-
-            if (depth < 64) {
-                active_paths[depth] = !is_last;
-            }
-
-            const children_count = node.children.items.len;
-            for (node.children.items, 0..) |child, idx| {
-                const child_is_last = (idx == children_count - 1);
-                self.visualizeHelper(child, depth + 1, active_paths, child_is_last);
-            }
-        }
-
-        pub fn visualizeWrite(self: Self, node: *TreeNode, writer: anytype) anyerror!void {
-            var active_paths = [_]bool{false} ** 64;
-            try self.visualizeHelperWrite(node, 0, &active_paths, true, writer);
-        }
-
-        fn visualizeHelperWrite(self: Self, node: *TreeNode, depth: usize, active_paths: *[64]bool, is_last: bool, writer: anytype) anyerror!void {
-            if (depth > 0) {
-                for (0..depth - 1) |i| {
-                    if (active_paths[i]) {
-                        try writer.print("│   ", .{});
-                    } else {
-                        try writer.print("    ", .{});
-                    }
-                }
-                if (is_last) {
-                    try writer.print("└── ", .{});
-                } else {
-                    try writer.print("├── ", .{});
-                }
-            }
-
-            try writer.print("node {}: ", .{node.id});
-
-            if (node.isLeaf()) {
-                const len = node.summary.dimensions[0];
-                if (len > 0) {
-                    const slice = self.chunks.items[node.start..(node.start + len)];
-                    if (slice.len > 10) {
-                        try writer.print("\"{s}...{s}\"\n", .{ slice[0..3], slice[slice.len - 3 ..] });
-                    } else {
-                        try writer.print("\"{s}\"\n", .{slice});
-                    }
-                } else {
-                    try writer.print("\"\"\n", .{});
-                }
-            } else {
-                try writer.print("\n", .{});
-            }
-
-            if (depth < 64) {
-                active_paths[depth] = !is_last;
-            }
-
-            const children_count = node.children.items.len;
-            for (node.children.items, 0..) |child, idx| {
-                const child_is_last = (idx == children_count - 1);
-                try self.visualizeHelperWrite(child, depth + 1, active_paths, child_is_last, writer);
-            }
-        }
 
         /// Collects nodes with a range of the give cursor and length
         ///
