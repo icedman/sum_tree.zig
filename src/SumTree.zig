@@ -619,6 +619,7 @@ pub fn SumTree(comptime ValueT: type) type {
         /// below 80% of MAX_NODE_CHILDREN. Also collapses the root if it is left with only 1 child.
         fn joinInternalNodes(self: *Self, target_node: *TreeNode) !void {
             if (target_node.isLeaf()) return;
+            
             if (target_node == self.root) {
                 // Root collapse case: copy child's children directly to the root, keeping root pointer fixed
                 if (self.root.children.items.len == 1) {
