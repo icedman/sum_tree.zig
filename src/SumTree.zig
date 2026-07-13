@@ -8,9 +8,6 @@ const AutoHashMap = std.AutoHashMap;
 const config = @import("config.zig");
 const Config = config.Config;
 
-const MAX_DIMENSIONS = 32;
-const MAX_CHILDREN = 32;
-
 /// Represents the bias direction for cursor seeking operations.
 pub const Bias = enum {
     left,
@@ -19,7 +16,7 @@ pub const Bias = enum {
 
 /// Aggregated multidimensional metrics/metadata for a node and its descendants.
 pub const Summary = struct {
-    dimensions: [MAX_DIMENSIONS]usize = [_]usize{0} ** MAX_DIMENSIONS,
+    dimensions: [config.MAX_DIMENSIONS]usize = [_]usize{0} ** config.MAX_DIMENSIONS,
 };
 
 /// A node in the B+ tree.
@@ -207,6 +204,11 @@ pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
             self.absolute = target_cursor.absolute;
         }
 
+        /// Checks whether two cursors point to the exact same position (same node and offset).
+        pub fn isEqual(self: Self, other: Self) bool {
+            return self.node == other.node and self.offset == other.offset;
+        }
+
         /// Walks up and across the tree structure to find the next sibling leaf node.
         fn nextLeaf(node: *NodeT) ?*NodeT {
             var curr = node;
@@ -361,7 +363,7 @@ pub fn SumTree(comptime ValueT: type) type {
         pub const TreeCursor = Cursor(Self, TreeNode);
         pub const TreeChunk = ArrayList(ValueT);
         pub const Summarizer = *const fn ([]const ValueT) Summary;
-        pub const CollectComparator = *const fn (TreeCursor) bool;
+        pub const CollectComparator = *const fn (TreeCursor) ?TreeCursor;
 
         enable_history: bool = false,
 
@@ -1433,12 +1435,10 @@ pub fn SumTree(comptime ValueT: type) type {
             _ = self;
             if (length == 0) {
                 var c = cursor;
-                c.absolute = c.resolveAbsolute();
                 return c.seekRight(0, 0);
             }
 
             var cur = cursor;
-            cur.absolute = cur.resolveAbsolute();
             const target_cursor = cur.seekRight(0, 0);
 
             var curr_node = target_cursor.node;
@@ -1452,13 +1452,12 @@ pub fn SumTree(comptime ValueT: type) type {
                     curr_node = next_node;
                     curr_offset = 0;
                 } else {
-                    var end_cur = TreeCursor{
+                    const end_cur = TreeCursor{
                         .tree = cursor.tree,
                         .node = curr_node,
                         .offset = curr_offset,
-                        .absolute = 0,
+                        .absolute = target_cursor.absolute,
                     };
-                    end_cur.absolute = end_cur.resolveAbsolute();
                     return end_cur;
                 }
             }
@@ -1469,7 +1468,10 @@ pub fn SumTree(comptime ValueT: type) type {
                 const available = node_size - curr_offset;
                 const consumed = @min(remaining, available);
 
-                try bucket.append(cursor.tree.allocator, curr_node);
+                // Only append if it's not already the last node in the bucket to prevent duplicates
+                if (bucket.items.len == 0 or bucket.items[bucket.items.len - 1] != curr_node) {
+                    try bucket.append(cursor.tree.allocator, curr_node);
+                }
 
                 remaining -= consumed;
                 curr_offset += consumed;
@@ -1484,13 +1486,12 @@ pub fn SumTree(comptime ValueT: type) type {
                 }
             }
 
-            var end_cur = TreeCursor{
+            const end_cur = TreeCursor{
                 .tree = cursor.tree,
                 .node = curr_node,
                 .offset = curr_offset,
-                .absolute = 0,
+                .absolute = target_cursor.absolute + (length - remaining),
             };
-            end_cur.absolute = end_cur.resolveAbsolute();
             return end_cur;
         }
 
@@ -1501,18 +1502,14 @@ pub fn SumTree(comptime ValueT: type) type {
             bucket: *ArrayList(*TreeNode),
         ) !TreeCursor {
             var curr_cursor = cursor;
-            curr_cursor.absolute = curr_cursor.resolveAbsolute();
 
             while (true) {
-                const prev_absolute = curr_cursor.absolute;
-                const next_cursor = try self.collect(curr_cursor, 1, bucket);
-                if (next_cursor.absolute == prev_absolute) {
+                const next_cursor = comparator(curr_cursor) orelse break;
+                if (next_cursor.isEqual(curr_cursor) or next_cursor.absolute <= curr_cursor.absolute) {
                     break;
                 }
-                curr_cursor = next_cursor;
-                if (comparator(curr_cursor)) {
-                    break;
-                }
+                const distance = next_cursor.absolute - curr_cursor.absolute;
+                curr_cursor = try self.collect(curr_cursor, distance, bucket);
             }
             return curr_cursor;
         }

@@ -847,8 +847,11 @@ test "SumTree collectUntil" {
     cursor = cursor.seekRight(4, 0);
 
     const Helper = struct {
-        pub fn match(cur: S.TreeCursor) bool {
-            return cur.resolveAbsolute() >= 8;
+        pub fn match(cur: S.TreeCursor) ?S.TreeCursor {
+            if (cur.absolute >= 8) {
+                return cur;
+            }
+            return cur.seekRight(8 - cur.absolute, 0);
         }
     };
 
@@ -858,26 +861,34 @@ test "SumTree collectUntil" {
     // End cursor absolute position should be 8
     try std.testing.expectEqual(@as(usize, 8), end_cursor.resolveAbsolute());
 
-    // We should have collected Leaf 2 and Leaf 3, with duplicates
-    try std.testing.expectEqual(@as(usize, 4), bucket.items.len);
+    // We should have collected Leaf 2 and Leaf 3, without duplicates
+    try std.testing.expectEqual(@as(usize, 2), bucket.items.len);
 
     // First collected node should be Leaf 2 containing "def"
     const leaf2 = bucket.items[0];
     const leaf2_slice = tree.chunks.items[leaf2.start .. leaf2.start + leaf2.summary.dimensions[0]];
     try std.testing.expectEqualSlices(u8, "def", leaf2_slice);
 
-    // Second collected node should be Leaf 2 containing "def"
-    const leaf2b = bucket.items[1];
-    try std.testing.expectEqual(leaf2, leaf2b);
-
-    // Third collected node should be Leaf 3 containing "abc"
-    const leaf3 = bucket.items[2];
+    // Second collected node should be Leaf 3 containing "abc"
+    const leaf3 = bucket.items[1];
     const leaf3_slice = tree.chunks.items[leaf3.start .. leaf3.start + leaf3.summary.dimensions[0]];
     try std.testing.expectEqualSlices(u8, "abc", leaf3_slice);
+}
 
-    // Fourth collected node should be Leaf 3 containing "abc"
-    const leaf3b = bucket.items[3];
-    try std.testing.expectEqual(leaf3, leaf3b);
+test "SumTree Cursor isEqual" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    _ = try tree.insert("abcdef", tree.createCursor());
+
+    const c1 = tree.createCursor().seekRight(2, 0);
+    const c2 = tree.createCursor().seekRight(2, 0);
+    const c3 = tree.createCursor().seekRight(4, 0);
+
+    try std.testing.expect(c1.isEqual(c2));
+    try std.testing.expect(!c1.isEqual(c3));
 }
 
 test "SumTree Iterator" {
