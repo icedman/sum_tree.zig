@@ -6,50 +6,61 @@ const st = sum_tree.SumTree;
 const SumTree = st.SumTree;
 const Dimensions = st.Dimensions;
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+fn randomWord(rand: std.Random, buf: []u8) []const u8 {
+    const len = rand.intRangeAtMost(usize, 1, 10);
+    for (0..len) |i| {
+        buf[i] = rand.intRangeAtMost(u8, 'a', 'z');
+    }
+    return buf[0..len];
+}
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
 
     const allocator = std.heap.page_allocator;
     const S = SumTree(u8);
     const tree = try S.init(allocator);
     defer tree.deinit();
 
-    var cur = tree.createCursor();
-    cur = try tree.insert("kim", cur);
-    cur = try tree.insert("josh", cur);
-    cur = try tree.insert("eli", cur);
-    tree.dump(tree.root, 0);
-    cur = tree.createCursor().seekRight(4, 0);
-    cur = try tree.insert("oops", cur);
-    tree.dump(tree.root, 0);
-    cur = tree.createCursor().seekRight(6, 0);
-    cur = try tree.erase(cur, 4);
-    tree.dump(tree.root, 0);
+    var prng = std.Random.DefaultPrng.init(0x12345678);
+    const rand = prng.random();
 
+    // 1. Insertion Phase: 2000 random words
+    var word_buf: [16]u8 = undefined;
+    for (0..2000) |_| {
+        const word = randomWord(rand, &word_buf);
+        const total_len = tree.root.summary.dimensions[0];
+        const pos = if (total_len == 0) 0 else rand.intRangeAtMost(usize, 0, total_len);
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+        const cur = tree.createCursor().seekRight(pos, 0);
+        _ = try tree.insert(word, cur);
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    // 2. Deletion Phase: 2000 random erasures
+    for (0..1000) |_| {
+        const total_len = tree.root.summary.dimensions[0];
+        if (total_len == 0) break;
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+        const pos = rand.intRangeLessThan(usize, 0, total_len);
+        const len = rand.intRangeAtMost(usize, 1, @min(10, total_len - pos));
 
-    try sum_tree.printAnotherMessage(stdout_writer);
+        const cur = tree.createCursor().seekRight(pos, 0);
+        _ = try tree.erase(cur, len);
+    }
 
-    try stdout_writer.flush(); // Don't forget to flush!
+    // Open output.txt and visualize the tree to it
+    const cwd = Io.Dir.cwd();
+    const file = try cwd.createFile(io, "output.txt", .{});
+    defer file.close(io);
+
+    var file_buffer: [4096]u8 = undefined;
+    var file_writer: Io.File.Writer = .init(file, io, &file_buffer);
+    const writer = &file_writer.interface;
+
+    try tree.visualizeWrite(tree.root, writer);
+    try writer.flush();
+
+    std.debug.print("Successfully ran 2000 words test and visualized to output.txt\n", .{});
 }
 
 test "simple test" {

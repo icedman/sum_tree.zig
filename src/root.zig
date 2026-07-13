@@ -18,3 +18,7 @@ test "basic add functionality" {
 }
 
 pub const SumTree = @import("SumTree.zig");
+
+test {
+    _ = @import("tests.zig");
+}

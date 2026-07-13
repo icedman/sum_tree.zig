@@ -348,7 +348,8 @@ pub fn SumTree(comptime ValueT: type) type {
         enable_history: bool = false,
 
         allocator: Allocator,
-        chunks: TreeChunk,
+        chunks: *TreeChunk,
+        managed_chunks: bool = true,
 
         timestamp: i64 = 0,
 
@@ -369,17 +370,59 @@ pub fn SumTree(comptime ValueT: type) type {
         /// Constructor: Allocates and initializes the SumTree container with an empty root node.
         pub fn init(allocator: Allocator) !*Self {
             const tree = try allocator.create(Self);
-            tree.* = Self{
-                .allocator = allocator,
-                .chunks = try TreeChunk.initCapacity(allocator, 32),
-                .nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32),
-                .clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32),
-                .redo_clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32),
-                .root = undefined,
-            };
+            errdefer allocator.destroy(tree);
+            
+            const chunks_ptr = try allocator.create(TreeChunk);
+            errdefer allocator.destroy(chunks_ptr);
+            chunks_ptr.* = try TreeChunk.initCapacity(allocator, 32);
+            errdefer chunks_ptr.deinit(allocator);
+
+            tree.nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32);
+            errdefer tree.nodes.deinit(allocator);
+
+            tree.clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
+            errdefer tree.clones.deinit(allocator);
+
+            tree.redo_clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
+            errdefer tree.redo_clones.deinit(allocator);
+
+            tree.allocator = allocator;
+            tree.chunks = chunks_ptr;
+            tree.managed_chunks = true;
+            tree.timestamp = 0;
+            tree.enable_history = false;
+            tree.summarize = defaultSummarizer;
+            tree.root = undefined;
+
             tree.root = try tree.createNode(&.{});
             return tree;
         }
+        
+        pub fn initWithChunk(allocator: Allocator, tree_chunks: *TreeChunk) !*Self {
+            const tree = try allocator.create(Self);
+            errdefer allocator.destroy(tree);
+            
+            tree.nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32);
+            errdefer tree.nodes.deinit(allocator);
+
+            tree.clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
+            errdefer tree.clones.deinit(allocator);
+
+            tree.redo_clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32);
+            errdefer tree.redo_clones.deinit(allocator);
+
+            tree.allocator = allocator;
+            tree.chunks = tree_chunks;
+            tree.managed_chunks = false;
+            tree.timestamp = 0;
+            tree.enable_history = false;
+            tree.summarize = defaultSummarizer;
+            tree.root = undefined;
+
+            tree.root = try tree.createNode(&.{});
+            return tree;
+        }
+
 
         /// Destructor: Destroys all allocated nodes and backing lists.
         pub fn deinit(self: *Self) void {
@@ -398,7 +441,10 @@ pub fn SumTree(comptime ValueT: type) type {
             self.nodes.deinit(self.allocator);
             self.clones.deinit(self.allocator);
             self.redo_clones.deinit(self.allocator);
-            self.chunks.deinit(self.allocator);
+            if (self.managed_chunks) {
+                self.chunks.deinit(self.allocator);
+                self.allocator.destroy(self.chunks);
+            }
         }
 
         /// Allocates a new node, appends it to the tracked list, and assigns its start and summary.
