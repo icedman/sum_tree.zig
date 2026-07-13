@@ -1,1581 +1,601 @@
 const std = @import("std");
-
 const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayList = std.ArrayList;
-const AutoHashMap = std.AutoHashMap;
 
-const config = @import("config.zig");
-const Config = config.Config;
+pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
+    return struct {
+        const BSelf = @This();
+        data: [capacity]T = undefined,
+        len: usize = 0,
 
-/// Represents the bias direction for cursor seeking operations.
-pub const Bias = enum {
-    left,
-    right,
-};
+        pub fn empty() BSelf {
+            return .{};
+        }
 
-/// Aggregated multidimensional metrics/metadata for a node and its descendants.
-pub const Summary = struct {
-    dimensions: [config.MAX_DIMENSIONS]usize = [_]usize{0} ** config.MAX_DIMENSIONS,
-};
+        pub fn append(self: *BSelf, item: T) void {
+            self.data[self.len] = item;
+            self.len += 1;
+        }
 
-/// A node in the B+ tree.
-/// Internal nodes have `children.items.len > 0`, while leaf nodes have no children
-/// and instead reference a slice of the flat backing chunk list starting at `start`.
-fn Node(comptime ValueT: type) type {
+        pub fn insert(self: *BSelf, idx: usize, item: T) void {
+            var i: usize = self.len;
+            while (i > idx) : (i -= 1) {
+                self.data[i] = self.data[i - 1];
+            }
+            self.data[idx] = item;
+            self.len += 1;
+        }
+
+        pub fn slice(self: BSelf) []const T {
+            return self.data[0..self.len];
+        }
+
+        pub fn sliceMut(self: *BSelf) []T {
+            return self.data[0..self.len];
+        }
+    };
+}
+
+pub fn SumTree(comptime ValueT: type) type {
     return struct {
         const Self = @This();
+        pub const MAX_CHILDREN = 8;
+        pub const MIN_CHILDREN = MAX_CHILDREN / 2;
 
-        const Clone = struct {
-            allocator: Allocator,
-            id: usize = 0,
-            parent_id: ?usize = null,
-            start: usize = 0,
-            children: ArrayList(usize),
-            summary: Summary = .{},
-            timestamp: i64 = 0,
-            node_timestamp: i64 = 0,
+        pub const Summary = struct {
+            dimensions: [1]usize = .{0},
 
-            pub fn init(allocator: Allocator) !*Clone {
-                const clone = try allocator.create(Clone);
-                clone.* = Clone{
-                    .allocator = allocator,
-                    .parent_id = null,
-                    .children = ArrayList(usize).empty,
-                };
-                return clone;
+            pub fn zero() Summary {
+                return .{ .dimensions = .{0} };
             }
 
-            pub fn deinit(self: *Clone) void {
-                self.children.deinit(self.allocator);
+            pub fn add(self: *Summary, other: Summary) void {
+                self.dimensions[0] += other.dimensions[0];
+            }
+        };
+
+        pub const Node = struct {
+            rc: usize = 1,
+            height: usize = 0,
+            summary: Summary = Summary.zero(),
+            start: usize = 0,
+            children: BoundedArray(*Node, MAX_CHILDREN) = .{},
+
+            pub fn initLeaf(allocator: Allocator) !*Node {
+                const node = try allocator.create(Node);
+                node.* = .{
+                    .rc = 1,
+                    .height = 0,
+                    .summary = Summary.zero(),
+                    .start = 0,
+                    .children = .{},
+                };
+                return node;
+            }
+
+            pub fn initInternal(allocator: Allocator, height: usize) !*Node {
+                const node = try allocator.create(Node);
+                node.* = .{
+                    .rc = 1,
+                    .height = height,
+                    .summary = Summary.zero(),
+                    .start = 0,
+                    .children = .{},
+                };
+                return node;
+            }
+
+            pub fn isLeaf(self: Node) bool {
+                return self.height == 0;
+            }
+
+            pub fn ref(self: *Node) *Node {
+                self.rc += 1;
+                return self;
+            }
+
+            pub fn deref(self: *Node, allocator: Allocator) void {
+                self.rc -= 1;
+                if (self.rc == 0) {
+                    if (self.height > 0) {
+                        for (self.children.slice()) |child| {
+                            child.deref(allocator);
+                        }
+                    }
+                    allocator.destroy(self);
+                }
+            }
+
+            pub fn clone(self: *Node, allocator: Allocator) !*Node {
+                const copy = try allocator.create(Node);
+                copy.* = .{
+                    .rc = 1,
+                    .height = self.height,
+                    .summary = self.summary,
+                    .start = self.start,
+                    .children = self.children,
+                };
+                if (self.height > 0) {
+                    for (copy.children.slice()) |child| {
+                        _ = child.ref();
+                    }
+                }
+                return copy;
+            }
+
+            pub fn summarize(self: *Node) void {
+                self.summary = Summary.zero();
+                if (self.isLeaf()) {
+                    // Leaf summary is preserved directly (updated during split/slice)
+                } else {
+                    for (self.children.slice()) |child| {
+                        self.summary.add(child.summary);
+                    }
+                }
             }
         };
 
         allocator: Allocator,
-
-        ref: *ValueT = undefined, // unused
-        parent: ?*Self = null,
-
-        // cloneable data
-        id: usize = 0,
-        parent_id: ?usize = null,
-        start: usize = 0,
-        children: ArrayList(*Self),
-        summary: Summary = .{},
-
-        timestamp: i64 = 0,
-
-        /// Constructor: Allocates memory for a Node and initializes its children array list.
-        pub fn init(allocator: Allocator) !*Self {
-            const node = try allocator.create(Self);
-            node.* = Self{
-                .allocator = allocator,
-                .parent_id = null,
-                .children = ArrayList(*Self).empty,
-            };
-            return node;
-        }
-
-        /// Destructor: Deinitializes the children list. Memory of nodes is freed by SumTree.
-        pub fn deinit(self: *Self) void {
-            self.children.deinit(self.allocator);
-        }
-
-        /// Checks if this node is a leaf node (i.e. has no children).
-        pub fn isLeaf(self: *const Self) bool {
-            return self.children.items.len == 0;
-        }
-
-        /// Attaches a child node to this node and updates the child's parent pointer.
-        pub fn attach(self: *Self, child: *Self) !void {
-            try self.children.append(self.allocator, child);
-            child.parent = self;
-            child.parent_id = self.id;
-        }
-
-        /// Recalculates this node's summary by summing the summaries of all its children.
-        pub fn summarize(self: *Self) void {
-            var d: Summary = .{};
-            for (self.children.items) |c| {
-                for (0..Config.DIMENSIONS) |i| {
-                    d.dimensions[i] += c.summary.dimensions[i];
-                }
-            }
-            self.summary = d;
-        }
-
-        /// Recursively prunes any descendants and immediate children that have zero length.
-        /// If a zero-length node is removed, merges adjacent sibling leaf nodes if they are contiguous based on start and L.
-        pub fn prune(self: *Self, tree: anytype) anyerror!void {
-            if (self.isLeaf()) return;
-
-            // First recursively prune children
-            for (self.children.items) |child| {
-                try child.prune(tree);
-            }
-
-            const old_len = self.children.items.len;
-
-            // Remove zero-length children in-place from list and merge contiguous siblings
-            var i: usize = 0;
-            while (i < self.children.items.len) {
-                const child = self.children.items[i];
-                if (child.summary.dimensions[0] == 0) {
-                    try tree.cloneNode(self);
-                    _ = self.children.orderedRemove(i);
-
-                    // Check contiguous leaf merge between left and right siblings
-                    if (i > 0 and i < self.children.items.len) {
-                        const left = self.children.items[i - 1];
-                        const right = self.children.items[i];
-                        if (left.isLeaf() and right.isLeaf()) {
-                            const left_L = left.summary.dimensions[0];
-                            const right_L = right.summary.dimensions[0];
-                            if (left.start + left_L == right.start) {
-                                try tree.cloneNode(left);
-                                left.summary = tree.summarize(tree.chunks.items[left.start .. left.start + left_L + right_L]);
-                                try tree.cloneNode(self);
-                                _ = self.children.orderedRemove(i);
-                            }
-                        }
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-
-            if (self.children.items.len != old_len) {
-                try tree.cloneNode(self);
-                self.summarize();
-            }
-        }
-
-        pub fn touch(self: *Self, timestamp: i64) void {
-            self.timestamp = timestamp;
-        }
-
-        pub fn depth(self: *Self) usize {
-            var d: usize = 0;
-            var n = self;
-            while (n.parent) |parent| {
-                d += 1;
-                n = parent;
-            }
-            return d;
-        }
-    };
-}
-
-/// A cursor pointing to a specific offset inside a node of the SumTree.
-pub fn Cursor(comptime TreeT: type, comptime NodeT: type) type {
-    return struct {
-        const Self = @This();
-
-        tree: *TreeT,
-        node: *NodeT,
-        offset: usize, // offset within the node
-        absolute: usize = 0,
-
-        /// Calculates the absolute position (offset from root index 0) of the cursor.
-        pub fn resolveAbsolute(self: Self) usize {
-            var abs = self.offset;
-            var curr = self.node;
-            while (curr.parent) |p| {
-                if (std.mem.indexOfScalar(*NodeT, p.children.items, curr)) |idx| {
-                    for (p.children.items[0..idx]) |sibling| {
-                        abs += sibling.summary.dimensions[0];
-                    }
-                    curr = p;
-                } else {
-                    break;
-                }
-            }
-            return abs;
-        }
-
-        /// Recalculates the node and offset for the cursor based on its current absolute position, by seeking from the root.
-        pub fn recalculate(self: *Self) void {
-            const root_cursor = self.tree.createCursor();
-            const target_cursor = root_cursor.seekRight(self.absolute, 0);
-            self.node = target_cursor.node;
-            self.offset = target_cursor.offset;
-            self.absolute = target_cursor.absolute;
-        }
-
-        /// Checks whether two cursors point to the exact same position (same node and offset).
-        pub fn isEqual(self: Self, other: Self) bool {
-            return self.node == other.node and self.offset == other.offset;
-        }
-
-        /// Walks up and across the tree structure to find the next sibling leaf node.
-        fn nextLeaf(node: *NodeT) ?*NodeT {
-            var curr = node;
-            while (curr.parent) |p| {
-                if (std.mem.indexOfScalar(*NodeT, p.children.items, curr)) |idx| {
-                    if (idx + 1 < p.children.items.len) {
-                        var next_sibling = p.children.items[idx + 1];
-                        // Walk down to the leftmost leaf child of the sibling subtree
-                        while (!next_sibling.isLeaf()) {
-                            next_sibling = next_sibling.children.items[0];
-                        }
-                        return next_sibling;
-                    }
-                }
-                curr = p;
-            }
-            return null;
-        }
-
-        /// Walks up and across the tree structure to find the previous sibling leaf node.
-        fn prevLeaf(node: *NodeT) ?*NodeT {
-            var curr = node;
-            while (curr.parent) |p| {
-                if (std.mem.indexOfScalar(*NodeT, p.children.items, curr)) |idx| {
-                    if (idx > 0) {
-                        var prev_sibling = p.children.items[idx - 1];
-                        // Walk down to the rightmost leaf child of the sibling subtree
-                        while (!prev_sibling.isLeaf()) {
-                            prev_sibling = prev_sibling.children.items[prev_sibling.children.items.len - 1];
-                        }
-                        return prev_sibling;
-                    }
-                }
-                curr = p;
-            }
-            return null;
-        }
-
-        /// Moves the cursor left by the given distance in the specified metric.
-        pub fn seekLeft(self: *const Self, distance: usize, metric: u8) Self {
-            var curr_node = self.node;
-            var curr_offset = self.offset;
-
-            // Normalize: if the cursor is at an internal node, descend to the leftmost leaf
-            while (!curr_node.isLeaf()) {
-                curr_node = curr_node.children.items[0];
-                curr_offset = 0;
-            }
-
-            var remaining = distance;
-            var curr_abs = self.absolute;
-
-            // Seek across leaf siblings to the left
-            while (remaining > 0) {
-                if (curr_offset >= remaining) {
-                    curr_offset -= remaining;
-                    if (metric == 0) {
-                        curr_abs -= remaining;
-                    }
-                    remaining = 0;
-                } else {
-                    remaining -= curr_offset;
-                    if (metric == 0) {
-                        curr_abs -= curr_offset;
-                    }
-                    if (prevLeaf(curr_node)) |prev_node| {
-                        curr_node = prev_node;
-                        curr_offset = prev_node.summary.dimensions[metric];
-                    } else {
-                        curr_offset = 0;
-                        remaining = 0;
-                    }
-                }
-            }
-
-            var res = Self{
-                .tree = self.tree,
-                .node = curr_node,
-                .offset = curr_offset,
-                .absolute = 0,
-            };
-            if (metric == 0) {
-                res.absolute = curr_abs;
-            } else {
-                res.absolute = res.resolveAbsolute();
-            }
-            return res;
-        }
-
-        /// Moves the cursor right by the given distance in the specified metric.
-        pub fn seekRight(self: *const Self, distance: usize, metric: u8) Self {
-            var curr_node = self.node;
-            var curr_offset = self.offset;
-
-            // Normalize: if the cursor is at an internal node, descend to the leftmost leaf
-            while (!curr_node.isLeaf()) {
-                curr_node = curr_node.children.items[0];
-                curr_offset = 0;
-            }
-
-            var remaining = distance;
-            var curr_abs = self.absolute;
-
-            // Seek across leaf siblings to the right
-            while (remaining > 0) {
-                const node_size = curr_node.summary.dimensions[metric];
-                if (curr_offset + remaining <= node_size) {
-                    curr_offset += remaining;
-                    if (metric == 0) {
-                        curr_abs += remaining;
-                    }
-                    remaining = 0;
-                } else {
-                    const step = node_size - curr_offset;
-                    remaining -= step;
-                    if (metric == 0) {
-                        curr_abs += step;
-                    }
-                    if (nextLeaf(curr_node)) |next_node| {
-                        curr_node = next_node;
-                        curr_offset = 0;
-                    } else {
-                        curr_offset = node_size;
-                        remaining = 0;
-                    }
-                }
-            }
-
-            var res = Self{
-                .tree = self.tree,
-                .node = curr_node,
-                .offset = curr_offset,
-                .absolute = 0,
-            };
-            if (metric == 0) {
-                res.absolute = curr_abs;
-            } else {
-                res.absolute = res.resolveAbsolute();
-            }
-            return res;
-        }
-    };
-}
-
-/// The main B+ tree container class.
-/// Aggregates flat backing chunks using hierarchical summaries, supporting logarithmic seeks and updates.
-pub fn SumTree(comptime ValueT: type) type {
-    return struct {
-        const Self = @This();
-
-        pub const TreeNode = Node(ValueT);
-        pub const TreeCursor = Cursor(Self, TreeNode);
-        pub const TreeChunk = ArrayList(ValueT);
-        pub const Summarizer = *const fn ([]const ValueT) Summary;
-        enable_history: bool = false,
-
-        allocator: Allocator,
-        chunks: *TreeChunk,
+        root: *Node,
+        chunks: *std.ArrayList(u8),
         managed_chunks: bool = true,
 
-        timestamp: i64 = 0,
-
-        nodes: ArrayList(*TreeNode),
-        clones: ArrayList(*TreeNode.Clone),
-        redo_clones: ArrayList(*TreeNode.Clone),
-        root: *TreeNode = undefined,
-
-        summarize: Summarizer = defaultSummarizer,
-
-        /// Default summarizer: computes the length of the slice and stores it in dimension 0.
-        fn defaultSummarizer(slice: []const ValueT) Summary {
-            var sum = Summary{};
-            sum.dimensions[0] = slice.len;
-            return sum;
-        }
-
-        /// Constructor: Allocates and initializes the SumTree container with an empty root node.
         pub fn init(allocator: Allocator) !*Self {
             const tree = try allocator.create(Self);
-            errdefer allocator.destroy(tree);
+            const root = try Node.initLeaf(allocator);
+            const chunks = try allocator.create(std.ArrayList(u8));
+            chunks.* = std.ArrayList(u8).empty;
 
-            const chunks_ptr = try allocator.create(TreeChunk);
-            errdefer allocator.destroy(chunks_ptr);
-            chunks_ptr.* = try TreeChunk.initCapacity(allocator, 32);
-            errdefer chunks_ptr.deinit(allocator);
-
-            tree.nodes = ArrayList(*TreeNode).empty;
-            tree.clones = ArrayList(*TreeNode.Clone).empty;
-            tree.redo_clones = ArrayList(*TreeNode.Clone).empty;
-
-            tree.allocator = allocator;
-            tree.chunks = chunks_ptr;
-            tree.managed_chunks = true;
-            tree.timestamp = 0;
-            tree.enable_history = false;
-            tree.summarize = defaultSummarizer;
-            tree.root = undefined;
-
-            tree.updateTimestamp();
-            tree.root = try tree.createNode(&.{});
-
+            tree.* = .{
+                .allocator = allocator,
+                .root = root,
+                .chunks = chunks,
+                .managed_chunks = true,
+            };
             return tree;
         }
 
-        pub fn initWithChunk(allocator: Allocator, tree_chunks: *TreeChunk) !*Self {
-            const tree = try allocator.create(Self);
-            errdefer allocator.destroy(tree);
-
-            tree.nodes = ArrayList(*TreeNode).empty;
-            tree.clones = ArrayList(*TreeNode.Clone).empty;
-            tree.redo_clones = ArrayList(*TreeNode.Clone).empty;
-
-            tree.allocator = allocator;
-            tree.chunks = tree_chunks;
-            tree.managed_chunks = false;
-            tree.timestamp = 0;
-            tree.enable_history = false;
-            tree.summarize = defaultSummarizer;
-            tree.root = undefined;
-
-            tree.updateTimestamp();
-            tree.root = try tree.createNode(&.{});
-            return tree;
-        }
-
-        /// Destructor: Destroys all allocated nodes and backing lists.
         pub fn deinit(self: *Self) void {
-            for (self.nodes.items) |c| {
-                c.deinit();
-                self.allocator.destroy(c);
-            }
-            for (self.clones.items) |c| {
-                c.deinit();
-                self.allocator.destroy(c);
-            }
-            for (self.redo_clones.items) |c| {
-                c.deinit();
-                self.allocator.destroy(c);
-            }
-            self.nodes.deinit(self.allocator);
-            self.clones.deinit(self.allocator);
-            self.redo_clones.deinit(self.allocator);
+            self.root.deref(self.allocator);
             if (self.managed_chunks) {
                 self.chunks.deinit(self.allocator);
                 self.allocator.destroy(self.chunks);
             }
+            self.allocator.destroy(self);
         }
 
-        /// Allocates a new node, appends it to the tracked list, and assigns its start and summary.
-        pub fn createNode(self: *Self, chunk: []const ValueT) !*TreeNode {
-            const node = try TreeNode.init(self.allocator);
-            try self.nodes.append(self.allocator, node);
-            node.id = self.nodes.items.len - 1;
-            node.start = self.chunks.items.len;
-            node.summary = self.summarize(chunk);
-            node.touch(self.timestamp);
-            return node;
-        }
-
-        /// Factory: Creates a cursor at the given node and offset.
-        pub fn createCursorAt(self: *Self, node: ?*TreeNode, offset: usize) TreeCursor {
-            var c = TreeCursor{
-                .tree = self,
-                .node = node orelse self.root,
-                .offset = offset,
-                .absolute = 0,
+        pub fn clone(self: *Self) !*Self {
+            const copy = try self.allocator.create(Self);
+            copy.* = .{
+                .allocator = self.allocator,
+                .root = self.root.ref(),
+                .chunks = self.chunks,
+                .managed_chunks = false,
             };
-            c.absolute = c.resolveAbsolute();
-            return c;
+            return copy;
         }
 
-        /// Factory: Creates a default cursor at the root (offset 0).
-        pub fn createCursor(self: *Self) TreeCursor {
-            return self.createCursorAt(null, 0);
-        }
-
-        /// Split internal B+ tree node algorithm:
-        /// When a node's children list exceeds MAX_NODE_CHILDREN, split it in half,
-        /// move the second half to a sibling node, and propagate the split up to the root.
-        fn splitInternalNode(self: *Self, target_node: *TreeNode) !void {
-            if (target_node.children.items.len <= Config.MAX_NODE_CHILDREN) return;
-
-            const half = target_node.children.items.len / 2;
-            const sibling_node = try self.createNode(&.{});
-
-            // Split children list in half
-            const right_children = target_node.children.items[half..];
-            for (right_children) |child| {
-                try self.cloneNode(child);
-                try sibling_node.children.append(self.allocator, child);
-                child.parent = sibling_node;
-            }
-            try self.cloneNode(target_node);
-            target_node.children.shrinkRetainingCapacity(half);
-
-            // Re-summarize both halves
-            target_node.summarize();
-            sibling_node.summarize();
-
-            if (target_node == self.root) {
-                // Root split case: create a new root, attach old root and sibling, and summarize
-                const new_root = try self.createNode(&.{});
-                self.root = new_root;
-
-                try self.cloneNode(target_node);
-                try new_root.attach(target_node);
-                try new_root.attach(sibling_node);
-
-                new_root.summarize();
-            } else {
-                // Non-root split case: insert sibling to parent, summarize parent, and propagate split
-                const parent = target_node.parent.?;
-                sibling_node.parent = parent;
-
-                const idx = std.mem.indexOfScalar(*TreeNode, parent.children.items, target_node).?;
-                try self.cloneNode(parent);
-                try parent.children.insert(self.allocator, idx + 1, sibling_node);
-
-                parent.summarize();
-
-                try self.splitInternalNode(parent);
+        fn makeMut(self: *Self, node_ptr: **Node) !void {
+            const node = node_ptr.*;
+            if (node.rc > 1) {
+                const copy = try node.clone(self.allocator);
+                node.deref(self.allocator);
+                node_ptr.* = copy;
             }
         }
 
+        fn joinNodes(self: *Self, left_ptr: **Node, right_ptr: **Node) !?*Node {
+            var left = left_ptr.*;
+            var right = right_ptr.*;
 
-        fn cloneNode(self: *Self, target_node: *TreeNode) !void {
-            if (self.enable_history) {
-                const clone = try TreeNode.Clone.init(self.allocator);
-                try self.clones.append(self.allocator, clone);
-                clone.id = target_node.id;
-                clone.parent_id = target_node.parent_id;
-                clone.start = target_node.start;
-                clone.summary = target_node.summary;
-                for (target_node.children.items) |item| {
-                    try clone.children.append(self.allocator, item.id);
-                }
-                clone.timestamp = self.timestamp;
-                clone.node_timestamp = target_node.timestamp;
-            }
-
-            target_node.touch(self.timestamp);
-        }
-
-        fn collapseSingleChildNodes(self: *Self, target_node: *TreeNode, last_node_ref: *?*TreeNode, last_offset_ref: *usize) anyerror!void {
-            if (target_node.isLeaf()) return;
-
-            // First recurse on children to collapse them from bottom up
-            var i: usize = 0;
-            while (i < target_node.children.items.len) {
-                const child = target_node.children.items[i];
-                try self.collapseSingleChildNodes(child, last_node_ref, last_offset_ref);
-                i += 1;
-            }
-
-            // Now check if target_node itself has only one child
-            if (target_node.children.items.len == 1) {
-                const child = target_node.children.items[0];
-                if (child.isLeaf()) {
-                    // Copy child's properties to target_node
-                    try self.cloneNode(target_node);
-                    target_node.start = child.start;
-                    target_node.summary = child.summary;
-
-                    // Clear target_node's children to make it a leaf
-                    target_node.children.clearRetainingCapacity();
-
-                    if (last_node_ref.* == child) {
-                        last_node_ref.* = target_node;
+            if (left.height == right.height) {
+                if (left.height == 0) {
+                    const left_L = left.summary.dimensions[0];
+                    if (left.start + left_L == right.start) {
+                        try self.makeMut(left_ptr);
+                        left_ptr.*.summary.dimensions[0] += right.summary.dimensions[0];
+                        right.deref(self.allocator);
+                        return null;
+                    } else {
+                        return right;
                     }
                 } else {
-                    // Promote child's children to target_node
-                    try self.cloneNode(target_node);
-                    target_node.children.clearRetainingCapacity();
-                    for (child.children.items) |c| {
-                        try self.cloneNode(c);
-                        try target_node.children.append(self.allocator, c);
-                        c.parent = target_node;
-                    }
-                    try self.cloneNode(child);
-                    child.children.clearRetainingCapacity();
-                }
-            }
-        }
-
-        /// Sibling joining B+ tree balancing algorithm:
-        /// Joins/merges adjacent sibling internal nodes if their combined children count falls
-        /// below 80% of MAX_NODE_CHILDREN. Also collapses the root if it is left with only 1 child.
-        fn joinInternalNodes(self: *Self, target_node: *TreeNode) !void {
-            if (target_node.isLeaf()) return;
-            
-            if (target_node == self.root) {
-                // Root collapse case: copy child's children directly to the root, keeping root pointer fixed
-                if (self.root.children.items.len == 1) {
-                    const child = self.root.children.items[0];
-                    if (!child.isLeaf()) {
-                        try self.cloneNode(self.root);
-                        self.root.children.clearRetainingCapacity();
-                        for (child.children.items) |c| {
-                            try self.cloneNode(c);
-                            try self.root.children.append(self.allocator, c);
-                            c.parent = self.root;
+                    const total_children = left.children.len + right.children.len;
+                    if (total_children <= MAX_CHILDREN) {
+                        try self.makeMut(left_ptr);
+                        left = left_ptr.*;
+                        for (right.children.slice()) |child| {
+                            left.children.append(child.ref());
                         }
-                        try self.cloneNode(child);
-                        child.children.clearRetainingCapacity();
-                        self.root.summarize();
+                        left.summarize();
+                        right.deref(self.allocator);
+                        return null;
+                    } else {
+                        try self.makeMut(left_ptr);
+                        left = left_ptr.*;
+
+                        var all_children = BoundedArray(*Node, MAX_CHILDREN * 2).empty();
+                        for (left.children.slice()) |child| {
+                            all_children.append(child.ref());
+                        }
+                        for (right.children.slice()) |child| {
+                            all_children.append(child.ref());
+                        }
+
+                        const midpoint = all_children.len / 2;
+
+                        for (left.children.slice()) |child| {
+                            child.deref(self.allocator);
+                        }
+                        left.children.len = 0;
+                        for (all_children.slice()[0..midpoint]) |child| {
+                            left.children.append(child);
+                        }
+                        left.summarize();
+
+                        const split_sibling = try Node.initInternal(self.allocator, left.height);
+                        for (all_children.slice()[midpoint..]) |child| {
+                            split_sibling.children.append(child);
+                        }
+                        split_sibling.summarize();
+
+                        right.deref(self.allocator);
+                        return split_sibling;
                     }
                 }
-                return;
-            }
+            } else if (left.height > right.height) {
+                try self.makeMut(left_ptr);
+                left = left_ptr.*;
 
-            const parent = target_node.parent orelse return;
-            const idx = std.mem.indexOfScalar(*TreeNode, parent.children.items, target_node) orelse return;
+                const last_idx = left.children.len - 1;
+                var last_child = left.children.data[last_idx];
+                const split_child = try self.joinNodes(&last_child, &right);
+                left.children.data[last_idx] = last_child;
 
-            // Sibling join check with left sibling
-            if (idx > 0) {
-                const left_sibling = parent.children.items[idx - 1];
-                const total_count = target_node.children.items.len + left_sibling.children.items.len;
-                if (total_count * 10 < 8 * Config.MAX_NODE_CHILDREN) {
-                    try self.cloneNode(left_sibling);
-                    for (target_node.children.items) |child| {
-                        try self.cloneNode(child);
-                        try left_sibling.children.append(self.allocator, child);
-                        child.parent = left_sibling;
+                if (split_child) |sc| {
+                    if (left.children.len < MAX_CHILDREN) {
+                        left.children.append(sc);
+                        left.summarize();
+                        return null;
+                    } else {
+                        var all_children = BoundedArray(*Node, MAX_CHILDREN + 1).empty();
+                        for (left.children.slice()) |child| {
+                            all_children.append(child.ref());
+                        }
+                        all_children.append(sc);
+
+                        const midpoint = all_children.len / 2;
+
+                        for (left.children.slice()) |child| {
+                            child.deref(self.allocator);
+                        }
+                        left.children.len = 0;
+                        for (all_children.slice()[0..midpoint]) |child| {
+                            left.children.append(child);
+                        }
+                        left.summarize();
+
+                        const split_sibling = try Node.initInternal(self.allocator, left.height);
+                        for (all_children.slice()[midpoint..]) |child| {
+                            split_sibling.children.append(child);
+                        }
+                        split_sibling.summarize();
+
+                        return split_sibling;
                     }
-                    try self.cloneNode(target_node);
-                    target_node.children.clearRetainingCapacity();
-
-                    try self.cloneNode(parent);
-                    _ = parent.children.orderedRemove(idx);
-
-                    left_sibling.summarize();
-                    parent.summarize();
-
-                    try self.joinInternalNodes(parent);
-                    return;
+                } else {
+                    left.summarize();
+                    return null;
                 }
-            }
-
-            // Sibling join check with right sibling
-            if (idx + 1 < parent.children.items.len) {
-                const right_sibling = parent.children.items[idx + 1];
-                const total_count = target_node.children.items.len + right_sibling.children.items.len;
-                if (total_count * 10 < 8 * Config.MAX_NODE_CHILDREN) {
-                    try self.cloneNode(target_node);
-                    for (right_sibling.children.items) |child| {
-                        try self.cloneNode(child);
-                        try target_node.children.append(self.allocator, child);
-                        child.parent = target_node;
-                    }
-                    try self.cloneNode(right_sibling);
-                    right_sibling.children.clearRetainingCapacity();
-
-                    try self.cloneNode(parent);
-                    _ = parent.children.orderedRemove(idx + 1);
-
-                    target_node.summarize();
-                    parent.summarize();
-
-                    try self.joinInternalNodes(parent);
-                    return;
-                }
-            }
-        }
-
-        /// Splits a leaf node at the given offset.
-        /// Useful when inserting or erasing in the middle of a leaf chunk.
-        fn splitLeafNode(self: *Self, target_node: *TreeNode, offset: usize) !*TreeNode {
-            const L = target_node.summary.dimensions[0];
-            if (target_node == self.root) {
-                // Split root leaf case: create prefix/suffix leaves, attach to root, summarize, split root if needed
-                const prefix_node = try self.createNode(&.{});
-                prefix_node.start = target_node.start;
-                prefix_node.summary = self.summarize(self.chunks.items[prefix_node.start..(prefix_node.start + offset)]);
-
-                const suffix_node = try self.createNode(&.{});
-                suffix_node.start = target_node.start + offset;
-                suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
-
-                try self.cloneNode(self.root);
-                try self.root.attach(prefix_node);
-                try self.root.attach(suffix_node);
-
-                prefix_node.parent.?.summarize();
-
-                try self.splitInternalNode(self.root);
-
-                return suffix_node;
             } else {
-                // Non-root leaf split: insert suffix leaf to parent, update summaries, split parent if needed
-                const parent_node = target_node.parent.?;
-                const idx = std.mem.indexOfScalar(*TreeNode, parent_node.children.items, target_node).?;
+                try self.makeMut(right_ptr);
+                right = right_ptr.*;
 
-                const suffix_node = try self.createNode(&.{});
-                suffix_node.start = target_node.start + offset;
-                suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
-                suffix_node.parent = parent_node;
+                var first_child = right.children.data[0];
+                const split_child = try self.joinNodes(&left, &first_child);
+                right.children.data[0] = first_child;
 
-                try self.cloneNode(target_node);
-                target_node.summary = self.summarize(self.chunks.items[target_node.start..(target_node.start + offset)]);
+                if (split_child) |sc| {
+                    if (right.children.len < MAX_CHILDREN) {
+                        var idx = right.children.len;
+                        while (idx > 0) : (idx -= 1) {
+                            right.children.data[idx] = right.children.data[idx - 1];
+                        }
+                        right.children.data[0] = sc;
+                        right.children.len += 1;
+                        right.summarize();
+                        return null;
+                    } else {
+                        var all_children = BoundedArray(*Node, MAX_CHILDREN + 1).empty();
+                        all_children.append(sc);
+                        for (right.children.slice()) |child| {
+                            all_children.append(child.ref());
+                        }
 
-                try self.cloneNode(parent_node);
-                try parent_node.children.insert(self.allocator, idx + 1, suffix_node);
+                        const midpoint = all_children.len / 2;
 
-                var curr_parent = target_node.parent;
-                while (curr_parent) |p| {
-                    try self.cloneNode(p);
-                    p.summarize();
-                    curr_parent = p.parent;
+                        var left_half = BoundedArray(*Node, MAX_CHILDREN).empty();
+                        var right_half = BoundedArray(*Node, MAX_CHILDREN).empty();
+                        for (all_children.slice()[0..midpoint]) |child| {
+                            left_half.append(child);
+                        }
+                        for (all_children.slice()[midpoint..]) |child| {
+                            right_half.append(child);
+                        }
+
+                        for (right.children.slice()) |child| {
+                            child.deref(self.allocator);
+                        }
+
+                        right.children.len = 0;
+                        for (left_half.slice()) |child| {
+                            right.children.append(child);
+                        }
+                        right.summarize();
+
+                        const split_sibling = try Node.initInternal(self.allocator, right.height);
+                        for (right_half.slice()) |child| {
+                            split_sibling.children.append(child);
+                        }
+                        split_sibling.summarize();
+
+                        return split_sibling;
+                    }
+                } else {
+                    right.summarize();
+                    return null;
                 }
-
-                try self.splitInternalNode(parent_node);
-
-                return suffix_node;
             }
         }
 
-        fn updateTimestamp(self: *Self) void {
-            var ts: std.posix.timespec = undefined;
-            var new_time: i64 = 0;
-            switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
-                .SUCCESS => {
-                    new_time = @intCast(ts.sec * std.time.ns_per_s + ts.nsec);
-                },
-                else => {},
-            }
-            if (new_time <= self.timestamp) {
-                self.timestamp += 1;
-            } else {
-                self.timestamp = new_time;
+        pub fn append(self: *Self, other: *Self) !void {
+            var r = other.root.ref();
+            const split_node = try self.joinNodes(&self.root, &r);
+            if (split_node) |sn| {
+                const new_root = try Node.initInternal(self.allocator, self.root.height + 1);
+                new_root.children.append(self.root);
+                new_root.children.append(sn);
+                new_root.summarize();
+                self.root = new_root;
             }
         }
 
-        /// B+ tree insertion algorithm:
-        /// Seeks cursor location, splits target leaf node if cursor is positioned in the middle,
-        /// inserts the new chunk as a sibling node, and propagates splits and summarizations up to the root.
-        pub fn insert(self: *Self, chunk: []const ValueT, cursor_: TreeCursor) !TreeCursor {
-            if (chunk.len == 0) {
-                var cursor = cursor_;
-                cursor.absolute = cursor.resolveAbsolute();
-                return cursor;
+        pub fn appendNode(self: *Self, other: **Node) !void {
+            const split_node = try self.joinNodes(&self.root, other);
+            if (split_node) |sn| {
+                const new_root = try Node.initInternal(self.allocator, self.root.height + 1);
+                new_root.children.append(self.root);
+                new_root.children.append(sn);
+                new_root.summarize();
+                self.root = new_root;
             }
+        }
 
-            self.clearRedoHistory();
-            self.updateTimestamp();
+        pub fn push(self: *Self, text: []const u8) !void {
+            if (text.len == 0) return;
+            const start_idx = self.chunks.items.len;
+            try self.chunks.appendSlice(self.allocator, text);
 
-            if (chunk.len > Config.MAX_CHUNK_LENGTH) {
-                var cur = cursor_;
-                var start_idx: usize = 0;
-                while (start_idx < chunk.len) {
-                    const end_idx = @min(chunk.len, start_idx + Config.MAX_CHUNK_LENGTH);
-                    const sub_chunk = chunk[start_idx..end_idx];
-                    cur = try self.insert(sub_chunk, cur);
-                    start_idx = end_idx;
-                }
-                return cur;
-            }
-            var cursor = cursor_;
-            cursor.absolute = cursor.resolveAbsolute();
+            const new_leaf = try Node.initLeaf(self.allocator);
+            new_leaf.start = start_idx;
+            new_leaf.summary.dimensions[0] = text.len;
 
-            const target_cursor = cursor.seekRight(0, 0);
-            const target_node = target_cursor.node;
-            const offset = target_cursor.offset;
-            const L = target_node.summary.dimensions[0];
+            var nl = new_leaf;
+            try self.appendNode(&nl);
+        }
 
-            // Check if we can simply append to the target node
-            if (offset == L and target_node.start + L == self.chunks.items.len) {
-                try self.chunks.appendSlice(self.allocator, chunk);
-                try self.cloneNode(target_node);
-                target_node.summary = self.summarize(self.chunks.items[target_node.start .. target_node.start + L + chunk.len]);
+        pub fn replace(self: *Self, start: usize, len: usize, text: []const u8) !void {
+            var cursor = Cursor.init(self);
+            const prefix = try cursor.slice(start);
+            defer prefix.deinit();
 
-                var c = cursor;
-                c.node = target_node;
-                c.offset = target_node.summary.dimensions[0];
-                c.absolute = c.resolveAbsolute();
+            cursor.seekTo(start + len);
+            const suffix = try cursor.suffix();
+            defer suffix.deinit();
 
-                // Bubble up summarization updates
-                var curr_parent = target_node.parent;
-                while (curr_parent) |p| {
-                    try self.cloneNode(p);
-                    p.summarize();
-                    curr_parent = p.parent;
-                }
+            const old_root = self.root;
+            self.root = try Node.initLeaf(self.allocator);
+            old_root.deref(self.allocator);
+
+            try self.append(prefix);
+            try self.push(text);
+            try self.append(suffix);
+        }
+
+        pub const Cursor = struct {
+            tree: *SumTree(ValueT),
+            stack: BoundedArray(StackEntry, 16) = .{},
+            offset: usize = 0,
+
+            pub const StackEntry = struct {
+                node: *Node,
+                index: usize,
+                offset: usize,
+            };
+
+            pub fn init(tree: *SumTree(ValueT)) Cursor {
+                var c = Cursor{
+                    .tree = tree,
+                };
+                c.reset();
                 return c;
             }
 
-            const n = try self.createNode(chunk);
-
-            if (target_node == self.root) {
-                // If found node is root, split/insert directly as child
-                try self.cloneNode(self.root);
-                if (offset > 0 and offset < L) {
-                    const prefix_node = try self.createNode(&.{});
-                    prefix_node.start = target_node.start;
-                    prefix_node.summary = self.summarize(self.chunks.items[prefix_node.start..(prefix_node.start + offset)]);
-
-                    const suffix_node = try self.createNode(&.{});
-                    suffix_node.start = target_node.start + offset;
-                    suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
-
-                    try self.root.attach(prefix_node);
-                    try self.root.attach(n);
-                    try self.root.attach(suffix_node);
-                } else if (offset == 0) {
-                    const suffix_node = try self.createNode(&.{});
-                    suffix_node.start = target_node.start;
-                    suffix_node.summary = target_node.summary;
-
-                    try self.root.attach(n);
-                    try self.root.attach(suffix_node);
-                } else {
-                    const prefix_node = try self.createNode(&.{});
-                    prefix_node.start = target_node.start;
-                    prefix_node.summary = target_node.summary;
-
-                    try self.root.attach(prefix_node);
-                    try self.root.attach(n);
-                }
-                try self.splitInternalNode(self.root);
-            } else {
-                // Insert as sibling in parent list, split leaf if in the middle
-                const parent_node = target_node.parent.?;
-                const idx = std.mem.indexOfScalar(*TreeNode, parent_node.children.items, target_node).?;
-
-                if (offset > 0 and offset < L) {
-                    const suffix_node = try self.createNode(&.{});
-                    suffix_node.start = target_node.start + offset;
-                    suffix_node.summary = self.summarize(self.chunks.items[suffix_node.start..(suffix_node.start + L - offset)]);
-                    suffix_node.parent = parent_node;
-
-                    try self.cloneNode(target_node);
-                    target_node.summary = self.summarize(self.chunks.items[target_node.start..(target_node.start + offset)]);
-
-                    try self.cloneNode(parent_node);
-                    try parent_node.children.insert(self.allocator, idx + 1, n);
-                    n.parent = parent_node;
-                    try parent_node.children.insert(self.allocator, idx + 2, suffix_node);
-                } else if (offset == 0) {
-                    try self.cloneNode(parent_node);
-                    try parent_node.children.insert(self.allocator, idx, n);
-                    n.parent = parent_node;
-                } else {
-                    try self.cloneNode(parent_node);
-                    try parent_node.children.insert(self.allocator, idx + 1, n);
-                    n.parent = parent_node;
-                }
-                try self.splitInternalNode(parent_node);
-            }
-
-            try self.chunks.appendSlice(self.allocator, chunk);
-
-            var c = cursor;
-            c.node = n;
-            c.offset = n.summary.dimensions[0];
-            c.absolute = c.resolveAbsolute();
-
-            // Bubble up summarization updates
-            var curr_parent = n.parent;
-            while (curr_parent) |p| {
-                try self.cloneNode(p);
-                p.summarize();
-                curr_parent = p.parent;
-            }
-
-            return c;
-        }
-
-        pub fn erase(self: *Self, cursor_: TreeCursor, length: usize) !TreeCursor {
-            if (length == 0) {
-                var cursor = cursor_;
-                cursor.absolute = cursor.resolveAbsolute();
-                return cursor;
-            }
-
-            self.clearRedoHistory();
-            self.updateTimestamp();
-
-            var cursor = cursor_;
-            cursor.absolute = cursor.resolveAbsolute();
-
-            const target_start_cursor = cursor.seekRight(0, 0);
-            var first_node = target_start_cursor.node;
-            var first_offset = target_start_cursor.offset;
-
-            const target_end_cursor = self.createCursorAt(null, 0).seekRight(cursor.absolute + length, 0);
-            var last_node: ?*TreeNode = target_end_cursor.node;
-            var last_offset = target_end_cursor.offset;
-
-            // Normalize boundaries
-            if (first_offset == first_node.summary.dimensions[0]) {
-                if (TreeCursor.nextLeaf(first_node)) |next_node| {
-                    first_node = next_node;
-                    first_offset = 0;
-                } else {
-                    return cursor;
-                }
-            }
-            if (last_node) |ln| {
-                if (last_offset == ln.summary.dimensions[0]) {
-                    if (TreeCursor.nextLeaf(ln)) |next_node| {
-                        last_node = next_node;
-                        last_offset = 0;
-                    } else {
-                        last_node = null;
-                        last_offset = 0;
-                    }
+            pub fn reset(self: *Cursor) void {
+                self.stack.len = 0;
+                self.offset = 0;
+                if (self.tree.root.summary.dimensions[0] > 0) {
+                    self.stack.append(.{
+                        .node = self.tree.root,
+                        .index = 0,
+                        .offset = 0,
+                    });
+                    self.descendToLeaf();
                 }
             }
 
-            // Utilize collectNodes to get all nodes in the range to be deleted
-            var collected_nodes = ArrayList(*TreeNode).empty;
-            defer collected_nodes.deinit(self.allocator);
-            _ = try self.collectNodes(target_start_cursor, length, &collected_nodes);
-
-            var affected_parents = ArrayList(*TreeNode).empty;
-            defer affected_parents.deinit(self.allocator);
-
-            if (first_node == last_node) {
-                const L = first_node.summary.dimensions[0];
-                if (first_offset == 0 and last_offset == L) {
-                    // Entire first/last node is deleted
-                    if (first_node == self.root) {
-                        try self.cloneNode(self.root);
-                        self.root.children.clearRetainingCapacity();
-                        self.root.summary = .{};
-                    } else {
-                        if (first_node.parent) |p| {
-                            try self.cloneNode(p);
-                            if (std.mem.indexOfScalar(*TreeNode, p.children.items, first_node)) |idx| {
-                                _ = p.children.orderedRemove(idx);
-                            }
-                            try self.markAffected(&affected_parents, p);
-                        }
-                    }
-                    last_node = null;
-                    last_offset = 0;
-                } else if (first_offset == 0) {
-                    // Keep suffix
-                    try self.cloneNode(first_node);
-                    first_node.start += last_offset;
-                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + L - last_offset]);
-                    if (first_node.parent) |p| {
-                        try self.markAffected(&affected_parents, p);
-                    }
-                } else if (last_offset == L) {
-                    // Keep prefix
-                    try self.cloneNode(first_node);
-                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + first_offset]);
-                    if (first_node.parent) |p| {
-                        try self.markAffected(&affected_parents, p);
-                    }
-                } else {
-                    // Middle delete
-                    const right_node = try self.splitLeafNode(first_node, last_offset);
-                    last_node = right_node;
-                    last_offset = 0;
-
-                    if (first_node == self.root) {
-                        first_node = self.root.children.items[0];
-                    }
-
-                    try self.cloneNode(first_node);
-                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + first_offset]);
-
-                    if (first_node.parent) |p| {
-                        try self.markAffected(&affected_parents, p);
-                    }
-                    if (right_node.parent) |p| {
-                        try self.markAffected(&affected_parents, p);
-                    }
+            fn descendToLeaf(self: *Cursor) void {
+                while (true) {
+                    const top = &self.stack.data[self.stack.len - 1];
+                    if (top.node.isLeaf()) break;
+                    const child = top.node.children.data[top.index];
+                    self.stack.append(.{
+                        .node = child,
+                        .index = 0,
+                        .offset = self.offset,
+                    });
                 }
-            } else {
-                // Different nodes: modify first and last leaf nodes, drop everything in between
-                var drop_first = false;
-                if (first_offset == 0) {
-                    drop_first = true;
-                } else {
-                    try self.cloneNode(first_node);
-                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + first_offset]);
-                    if (first_node.parent) |p| {
-                        try self.markAffected(&affected_parents, p);
-                    }
-                }
+            }
 
-                var drop_last = false;
-                if (last_node) |ln| {
-                    const L_last = ln.summary.dimensions[0];
-                    if (last_offset == L_last) {
-                        drop_last = true;
-                    } else {
-                        try self.cloneNode(ln);
-                        ln.start += last_offset;
-                        ln.summary = self.summarize(self.chunks.items[ln.start .. ln.start + L_last - last_offset]);
-                        if (ln.parent) |p| {
-                            try self.markAffected(&affected_parents, p);
-                        }
-                    }
-                }
+            pub fn seekTo(self: *Cursor, target: usize) void {
+                self.reset();
+                if (self.stack.len == 0) return;
 
-                // Drop intermediate nodes + optionally first_node / last_node
-                for (collected_nodes.items) |node| {
-                    var should_drop = false;
-                    if (node == first_node) {
-                        should_drop = drop_first;
-                    } else if (node == last_node) {
-                        should_drop = drop_last;
-                    } else {
-                        should_drop = true;
-                    }
+                self.stack.len = 0;
+                self.offset = 0;
 
-                    if (should_drop) {
-                        if (node == last_node) {
-                            last_node = null;
-                            last_offset = 0;
-                        }
-                        if (node == self.root) {
-                            try self.cloneNode(self.root);
-                            self.root.children.clearRetainingCapacity();
-                            self.root.summary = .{};
+                var curr = self.tree.root;
+                while (true) {
+                    if (curr.isLeaf()) {
+                        const top = StackEntry{
+                            .node = curr,
+                            .index = 0,
+                            .offset = self.offset,
+                        };
+                        self.stack.append(top);
+                        const remaining = target - self.offset;
+                        const leaf_size = curr.summary.dimensions[0];
+                        if (remaining >= leaf_size) {
+                            self.offset += leaf_size;
                         } else {
-                            if (node.parent) |p| {
-                                try self.cloneNode(p);
-                                if (std.mem.indexOfScalar(*TreeNode, p.children.items, node)) |idx| {
-                                    _ = p.children.orderedRemove(idx);
-                                }
-                                try self.markAffected(&affected_parents, p);
+                            self.offset = target;
+                        }
+                        break;
+                    } else {
+                        var child_offset = self.offset;
+                        var found_child = false;
+                        for (curr.children.slice(), 0..) |child, idx| {
+                            const child_size = child.summary.dimensions[0];
+                            if (target < child_offset + child_size) {
+                                self.stack.append(.{
+                                    .node = curr,
+                                    .index = idx,
+                                    .offset = self.offset,
+                                });
+                                self.offset = child_offset;
+                                curr = child;
+                                found_child = true;
+                                break;
                             }
+                            child_offset += child_size;
+                        }
+                        if (!found_child) {
+                            const last_idx = curr.children.len - 1;
+                            const last_child = curr.children.data[last_idx];
+                            self.stack.append(.{
+                                .node = curr,
+                                .index = last_idx,
+                                .offset = self.offset,
+                            });
+                            self.offset = child_offset - last_child.summary.dimensions[0];
+                            curr = last_child;
                         }
                     }
                 }
             }
 
-            // Re-summarize affected parents
-            for (affected_parents.items) |parent| {
-                parent.summarize();
-            }
+            pub fn slice(self: *Cursor, length: usize) !*SumTree(ValueT) {
+                const slice_tree = try SumTree(ValueT).init(self.tree.allocator);
+                errdefer slice_tree.deinit();
 
-            // Bubble up updates
-            for (affected_parents.items) |parent| {
-                var curr_parent: ?*TreeNode = parent;
-                while (curr_parent) |p| {
-                    try self.cloneNode(p);
-                    p.summarize();
-                    curr_parent = p.parent;
-                }
-            }
+                slice_tree.chunks.deinit(slice_tree.allocator);
+                slice_tree.allocator.destroy(slice_tree.chunks);
+                slice_tree.chunks = self.tree.chunks;
+                slice_tree.managed_chunks = false;
 
-            // Prune zero-length nodes recursively
-            try self.root.prune(self);
-
-            // Join siblings recursively
-            for (affected_parents.items) |parent| {
-                if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, parent) != null) {
-                    try self.joinInternalNodes(parent);
-                }
-            }
-
-            // Merge contiguous sibling leaf nodes
-            var last_node_ref = last_node;
-            var last_offset_ref = last_offset;
-            for (affected_parents.items) |parent| {
-                if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, parent) != null) {
-                    try self.mergeContiguousLeaves(parent, &last_node_ref, &last_offset_ref);
-                }
-            }
-
-            // Collapse redundant single-child internal nodes
-            try self.collapseSingleChildNodes(self.root, &last_node_ref, &last_offset_ref);
-
-            // Find rightmost leaf node for end cursor if last_node_ref is null
-            var curr_rightmost = self.root;
-            while (!curr_rightmost.isLeaf()) {
-                curr_rightmost = curr_rightmost.children.items[curr_rightmost.children.items.len - 1];
-            }
-
-            // Return end cursor
-            var c = if (last_node_ref) |ln| TreeCursor{
-                .tree = self,
-                .node = ln,
-                .offset = last_offset_ref,
-                .absolute = 0,
-            } else TreeCursor{
-                .tree = self,
-                .node = curr_rightmost,
-                .offset = curr_rightmost.summary.dimensions[0],
-                .absolute = 0,
-            };
-            c.absolute = c.resolveAbsolute();
-
-            var is_detached = true;
-            if (last_node_ref) |ln| {
-                if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, ln) != null) {
-                    is_detached = false;
-                    if (ln.parent) |p| {
-                        if (std.mem.indexOfScalar(*TreeNode, p.children.items, ln) == null) {
-                            is_detached = true;
-                        }
-                    } else if (ln != self.root) {
-                        is_detached = true;
-                    }
-                }
-            } else {
-                is_detached = false;
-            }
-
-            if (is_detached) {
-                c.recalculate();
-            }
-
-            return c;
-        }
-
-        fn markAffected(self: *Self, affected: *ArrayList(*TreeNode), parent: *TreeNode) !void {
-            for (affected.items) |item| {
-                if (item == parent) return;
-            }
-            try affected.append(self.allocator, parent);
-        }
-
-        fn mergeContiguousLeaves(self: *Self, parent: *TreeNode, last_node_ref: *?*TreeNode, last_offset_ref: *usize) !void {
-            if (parent.isLeaf()) return;
-            var i: usize = 0;
-            while (i < parent.children.items.len) {
-                const child = parent.children.items[i];
-                if (child.isLeaf()) {
-                    // Try to merge with right sibling if contiguous
-                    if (i + 1 < parent.children.items.len) {
-                        const right = parent.children.items[i + 1];
-                        if (right.isLeaf()) {
-                            const left_L = child.summary.dimensions[0];
-                            const right_L = right.summary.dimensions[0];
-                            if (child.start + left_L == right.start) {
-                                try self.cloneNode(child);
-                                child.summary = self.summarize(self.chunks.items[child.start .. child.start + left_L + right_L]);
-                                try self.cloneNode(parent);
-                                const sibling = parent.children.orderedRemove(i + 1);
-                                if (last_node_ref.* == sibling) {
-                                    last_node_ref.* = child;
-                                    last_offset_ref.* += left_L;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-                i += 1;
-            }
-        }
-        
-        pub fn collectLeaves(self: *Self, cursor_: TreeCursor, length: usize, bucket: *ArrayList(*TreeNode)) !TreeCursor {
-            if (length == 0) {
-                return cursor_;
-            }
-
-            var cursor1 = cursor_;
-            // Normalize cursor1 to be at leaf level if it's at an internal node
-            while (!cursor1.node.isLeaf()) {
-                cursor1.node = cursor1.node.children.items[0];
-                cursor1.offset = 0;
-            }
-
-            const cursor2 = cursor1.seekRight(length, 0);
-
-            var curr_node = cursor1.node;
-            var curr_offset = cursor1.offset;
-
-            // If the start cursor is at the end of the node, advance to the next leaf
-            if (curr_offset == curr_node.summary.dimensions[0]) {
-                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                    curr_node = next_node;
-                    curr_offset = 0;
-                } else {
-                    return cursor2;
-                }
-            }
-
-            // Loop and collect leaf nodes until we reach cursor2.node
-            while (true) {
-                try bucket.append(self.allocator, curr_node);
-
-                if (curr_node == cursor2.node) {
-                    break;
+                if (length == 0 or self.stack.len == 0) {
+                    return slice_tree;
                 }
 
-                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                    curr_node = next_node;
-                } else {
-                    break;
-                }
-            }
+                var remaining = length;
+                while (remaining > 0 and self.stack.len > 0) {
+                    const leaf_entry = &self.stack.data[self.stack.len - 1];
+                    const leaf_node = leaf_entry.node;
+                    const leaf_size = leaf_node.summary.dimensions[0];
+                    const leaf_offset = self.offset - leaf_entry.offset;
+                    const available = leaf_size - leaf_offset;
 
-            return cursor2;
-        }
-        
-        pub fn collectNodes(self: *Self, cursor_: TreeCursor, length: usize, bucket: *ArrayList(*TreeNode)) !TreeCursor {
-            if (length == 0) {
-                return cursor_;
-            }
+                    if (remaining <= available) {
+                        const slice_leaf = try Node.initLeaf(self.tree.allocator);
+                        slice_leaf.start = leaf_node.start + leaf_offset;
+                        slice_leaf.summary.dimensions[0] = remaining;
 
-            var cursor1 = cursor_;
-            // Normalize cursor1 to be at leaf level if it's at an internal node
-            while (!cursor1.node.isLeaf()) {
-                cursor1.node = cursor1.node.children.items[0];
-                cursor1.offset = 0;
-            }
+                        var sl = slice_leaf;
+                        try slice_tree.appendNode(&sl);
+                        self.offset += remaining;
+                        remaining = 0;
+                        break;
+                    } else {
+                        const slice_leaf = try Node.initLeaf(self.tree.allocator);
+                        slice_leaf.start = leaf_node.start + leaf_offset;
+                        slice_leaf.summary.dimensions[0] = available;
 
-            const cursor2 = cursor1.seekRight(length, 0);
+                        var sl = slice_leaf;
+                        try slice_tree.appendNode(&sl);
+                        self.offset += available;
+                        remaining -= available;
 
-            var curr_node = cursor1.node;
-            var curr_offset = cursor1.offset;
-
-            // If the start cursor is at the end of the node, advance to the next leaf
-            if (curr_offset == curr_node.summary.dimensions[0]) {
-                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                    curr_node = next_node;
-                    curr_offset = 0;
-                } else {
-                    return cursor2;
-                }
-            }
-
-            var remaining = length;
-            const node_size = curr_node.summary.dimensions[0];
-            const available = node_size - curr_offset;
-
-            if (remaining <= available) {
-                try bucket.append(self.allocator, curr_node);
-                remaining = 0;
-            } else {
-                try bucket.append(self.allocator, curr_node);
-                remaining -= available;
-                curr_offset = 0;
-
-                // Walk up the parent chain to find right siblings
-                var curr = curr_node;
-                while (curr.parent) |p| {
-                    if (std.mem.indexOfScalar(*TreeNode, p.children.items, curr)) |idx| {
-                        if (idx + 1 < p.children.items.len) {
-                            var i = idx + 1;
-                            while (i < p.children.items.len) : (i += 1) {
-                                const sibling = p.children.items[i];
+                        self.stack.len -= 1;
+                        var descended = false;
+                        while (self.stack.len > 0) {
+                            var top = &self.stack.data[self.stack.len - 1];
+                            if (top.index + 1 < top.node.children.len) {
+                                top.index += 1;
+                                const sibling = top.node.children.data[top.index];
                                 const sibling_size = sibling.summary.dimensions[0];
+
                                 if (remaining >= sibling_size) {
-                                    // Sibling subtree is fully covered, collect it directly without descending!
-                                    try bucket.append(self.allocator, sibling);
+                                    var sib = sibling.ref();
+                                    try slice_tree.appendNode(&sib);
+                                    self.offset += sibling_size;
                                     remaining -= sibling_size;
-                                } else if (remaining > 0) {
-                                    // Boundary lies inside this sibling subtree, descend into it
-                                    curr_node = sibling;
-                                    while (!curr_node.isLeaf()) {
-                                        for (curr_node.children.items) |child| {
-                                            const child_size = child.summary.dimensions[0];
-                                            if (remaining >= child_size) {
-                                                try bucket.append(self.allocator, child);
-                                                remaining -= child_size;
-                                            } else {
-                                                curr_node = child;
-                                                break;
-                                            }
-                                        }
+                                } else {
+                                    self.stack.append(.{
+                                        .node = sibling,
+                                        .index = 0,
+                                        .offset = self.offset,
+                                    });
+                                    while (true) {
+                                        const new_top = &self.stack.data[self.stack.len - 1];
+                                        if (new_top.node.isLeaf()) break;
+                                        const child = new_top.node.children.data[0];
+                                        self.stack.append(.{
+                                            .node = child,
+                                            .index = 0,
+                                            .offset = self.offset,
+                                        });
                                     }
-                                    if (remaining > 0) {
-                                        try bucket.append(self.allocator, curr_node);
-                                        remaining = 0;
-                                    }
+                                    descended = true;
                                     break;
                                 }
+                            } else {
+                                self.stack.len -= 1;
                             }
-                            if (remaining == 0) break;
+                        }
+                        if (!descended and remaining > 0) {
+                            break;
                         }
                     }
-                    curr = p;
-                }
-            }
-
-            return cursor2;
-        }
-
-        /// Recomputes summaries for all nodes in the tree recursively from the root down.
-        pub fn recomputeSummaries(self: *Self) !void {
-            self.clearRedoHistory();
-            self.updateTimestamp();
-            try self.recomputeSummariesHelper(self.root);
-        }
-
-        fn recomputeSummariesHelper(self: *Self, node: *TreeNode) anyerror!void {
-            try self.cloneNode(node);
-
-            if (node.isLeaf()) {
-                const len = node.summary.dimensions[0];
-                const slice = self.chunks.items[node.start .. node.start + len];
-                node.summary = self.summarize(slice);
-            } else {
-                for (node.children.items) |child| {
-                    try self.recomputeSummariesHelper(child);
-                }
-                node.summarize();
-            }
-        }
-
-        pub fn clearRedoHistory(self: *Self) void {
-            while (self.redo_clones.pop()) |c| {
-                c.deinit();
-                self.allocator.destroy(c);
-            }
-        }
-
-        pub fn undo(self: *Self) !void {
-            const count = self.clones.items.len;
-            if (count == 0) return;
-
-            var timestamp: i64 = 0;
-            var i = count;
-
-            while (i > 0) : (i -= 1) {
-                const clone = self.clones.items[i - 1];
-
-                // Stop if timestamps don’t match
-                if (timestamp != 0 and timestamp != clone.timestamp) break;
-                timestamp = clone.timestamp;
-
-                var shadow: *TreeNode = self.nodes.items[clone.id];
-
-                // 1. Snapshot the CURRENT active state to redo_clones before overwriting it!
-                const redo_clone = try TreeNode.Clone.init(self.allocator);
-                try self.redo_clones.append(self.allocator, redo_clone);
-                redo_clone.id = shadow.id;
-                redo_clone.parent_id = shadow.parent_id;
-                redo_clone.start = shadow.start;
-                redo_clone.summary = shadow.summary;
-                for (shadow.children.items) |child| {
-                    try redo_clone.children.append(self.allocator, child.id);
-                }
-                redo_clone.timestamp = clone.timestamp;
-                redo_clone.node_timestamp = shadow.timestamp;
-
-                // 2. Revert active node to the undone state
-                if (clone.parent_id) |p_id| {
-                    shadow.parent = self.nodes.items[p_id];
-                    shadow.parent_id = p_id;
-                } else {
-                    shadow.parent = null;
-                    shadow.parent_id = null;
                 }
 
-                shadow.start = clone.start;
-                shadow.summary = clone.summary;
-                shadow.timestamp = clone.node_timestamp;
-                shadow.children.clearRetainingCapacity();
-
-                for (clone.children.items) |item| {
-                    var child: *TreeNode = self.nodes.items[item];
-                    try shadow.children.append(shadow.allocator, child);
-                    child.parent = shadow;
-                    child.parent_id = shadow.id;
-                }
+                return slice_tree;
             }
 
-            // Pop and destroy the undone clones
-            while (self.clones.items.len > i) {
-                const clone = self.clones.pop().?;
-                clone.deinit();
-                self.allocator.destroy(clone);
-            }
-
-            // Restore self.root to the topmost ancestor of the first node
-            if (self.nodes.items.len > 0) {
-                var curr = self.nodes.items[0];
-                while (curr.parent) |p| {
-                    curr = p;
-                }
-                self.root = curr;
-            }
-        }
-
-        pub fn redo(self: *Self) !void {
-            const count = self.redo_clones.items.len;
-            if (count == 0) return;
-
-            var timestamp: i64 = 0;
-            var i = count;
-
-            while (i > 0) : (i -= 1) {
-                const clone = self.redo_clones.items[i - 1];
-
-                // Stop if timestamps don’t match
-                if (timestamp != 0 and timestamp != clone.timestamp) break;
-                timestamp = clone.timestamp;
-
-                var shadow: *TreeNode = self.nodes.items[clone.id];
-
-                // 1. Snapshot the CURRENT active state back to clones (for future undo)
-                const undo_clone = try TreeNode.Clone.init(self.allocator);
-                try self.clones.append(self.allocator, undo_clone);
-                undo_clone.id = shadow.id;
-                undo_clone.parent_id = shadow.parent_id;
-                undo_clone.start = shadow.start;
-                undo_clone.summary = shadow.summary;
-                for (shadow.children.items) |child| {
-                    try undo_clone.children.append(self.allocator, child.id);
-                }
-                undo_clone.timestamp = clone.timestamp;
-                undo_clone.node_timestamp = shadow.timestamp;
-
-                // 2. Re-apply the redone state
-                if (clone.parent_id) |p_id| {
-                    shadow.parent = self.nodes.items[p_id];
-                    shadow.parent_id = p_id;
-                } else {
-                    shadow.parent = null;
-                    shadow.parent_id = null;
-                }
-
-                shadow.start = clone.start;
-                shadow.summary = clone.summary;
-                shadow.timestamp = clone.node_timestamp;
-                shadow.children.clearRetainingCapacity();
-
-                for (clone.children.items) |item| {
-                    var child: *TreeNode = self.nodes.items[item];
-                    try shadow.children.append(shadow.allocator, child);
-                    child.parent = shadow;
-                    child.parent_id = shadow.id;
-                }
-            }
-
-            // Pop and destroy the redone clones from the redo stack
-            while (self.redo_clones.items.len > i) {
-                const clone = self.redo_clones.pop().?;
-                clone.deinit();
-                self.allocator.destroy(clone);
-            }
-
-            // Restore self.root to the topmost ancestor of the first node
-            if (self.nodes.items.len > 0) {
-                var curr = self.nodes.items[0];
-                while (curr.parent) |p| {
-                    curr = p;
-                }
-                self.root = curr;
-            }
-        }
-
-        pub fn dump(self: Self, node: *TreeNode, depth: usize) void {
-            for (0..depth) |_| std.debug.print("  ", .{});
-            // std.debug.print("?{*} -> {*}\n", .{ node, node.parent });
-            std.debug.print("node {}: ", .{node.id});
-
-            if (node.isLeaf()) {
-                const len = node.summary.dimensions[0];
-                if (len > 0) {
-                    const slice = self.chunks.items[node.start..(node.start + len)];
-                    std.debug.print("{s}\n", .{slice});
-                }
-            } else {
-                std.debug.print("\n", .{});
-            }
-
-            for (node.children.items) |n| {
-                self.dump(n, depth + 1);
-            }
-        }
-
-        /// Create or update a snapshot of the tree
-        /// Clone tree to self
-        pub fn snapshot(self: *Self, tree: *Self) !bool {
-            var changed = false;
-
-            // 1. Create the same number of nodes - add nodes to self if children count is less than tree children
-            if (self.nodes.items.len < tree.nodes.items.len) {
-                changed = true;
-                try self.nodes.ensureTotalCapacity(self.allocator, tree.nodes.items.len);
-                while (self.nodes.items.len < tree.nodes.items.len) {
-                    const node = try TreeNode.init(self.allocator);
-                    try self.nodes.append(self.allocator, node);
-                    node.id = self.nodes.items.len - 1;
-                }
-            } else if (self.nodes.items.len > tree.nodes.items.len) {
-                changed = true;
-                while (self.nodes.items.len > tree.nodes.items.len) {
-                    const node = self.nodes.pop().?;
-                    node.deinit();
-                    self.allocator.destroy(node);
-                }
-            }
-
-            // 2. Loop through the nodes array of each and compare timestamp
-            for (0..tree.nodes.items.len) |i| {
-                const tree_node = tree.nodes.items[i];
-                const self_node = self.nodes.items[i];
-
-                // 3. If timestamps are not the same, copy - summary from tree and rebuild children and parent based
-                //    on tree.children ids
-                if (self_node.timestamp != tree_node.timestamp) {
-                    changed = true;
-                    self_node.start = tree_node.start;
-                    self_node.summary = tree_node.summary;
-                    self_node.timestamp = tree_node.timestamp;
-                    self_node.parent_id = tree_node.parent_id;
-
-                    self_node.children.clearRetainingCapacity();
-                    for (tree_node.children.items) |child| {
-                        try self_node.children.append(self.allocator, self.nodes.items[child.id]);
-                    }
-                }
-            }
-
-            // Rebuild parent pointers for all nodes to ensure consistency
-            // for (0..tree.nodes.items.len) |i| {
-            //     const tree_node = tree.nodes.items[i];
-            //     const self_node = self.nodes.items[i];
-            //     if (tree_node.parent_id) |p_id| {
-            //         self_node.parent = self.nodes.items[p_id];
-            //         self_node.parent_id = p_id;
-            //     } else {
-            //         self_node.parent = null;
-            //         self_node.parent_id = null;
-            //     }
-            // }
-
-            // Sync tree root and tree timestamp
-            const target_root = self.nodes.items[tree.root.id];
-            if (self.root != target_root) {
-                self.root = target_root;
-                changed = true;
-            }
-
-            if (self.timestamp != tree.timestamp) {
-                self.timestamp = tree.timestamp;
-                changed = true;
-            }
-
-            // Sync chunks array if snapshot manages its own chunks
-            // Otherwise, it is assumed snapshot points to the same TreeChunks
-            if (self.managed_chunks) {
-                if (!std.mem.eql(ValueT, self.chunks.items, tree.chunks.items)) {
-                    self.chunks.clearRetainingCapacity();
-                    try self.chunks.appendSlice(self.allocator, tree.chunks.items);
-                    changed = true;
-                }
-            }
-
-            return changed;
-        }
-
-        pub const Iterator = struct {
-            tree: *Self,
-            curr_node: ?*TreeNode,
-
-            pub fn next(self: *Iterator) ?[]const ValueT {
-                while (self.curr_node) |node| {
-                    const len = node.summary.dimensions[0];
-                    self.curr_node = TreeCursor.nextLeaf(node);
-                    if (len > 0) {
-                        return self.tree.chunks.items[node.start .. node.start + len];
-                    }
-                }
-                return null;
+            pub fn suffix(self: *Cursor) !*SumTree(ValueT) {
+                const total_size = self.tree.root.summary.dimensions[0];
+                const remaining = if (total_size > self.offset) total_size - self.offset else 0;
+                return self.slice(remaining);
             }
         };
-
-        pub fn iterator(self: *Self) Iterator {
-            var curr = self.root;
-            while (!curr.isLeaf()) {
-                curr = curr.children.items[0];
-            }
-            return Iterator{
-                .tree = self,
-                .curr_node = curr,
-            };
-        }
     };
 }
