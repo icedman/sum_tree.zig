@@ -363,8 +363,6 @@ pub fn SumTree(comptime ValueT: type) type {
         pub const TreeCursor = Cursor(Self, TreeNode);
         pub const TreeChunk = ArrayList(ValueT);
         pub const Summarizer = *const fn ([]const ValueT) Summary;
-        pub const CollectComparator = *const fn (TreeCursor) ?TreeCursor;
-
         enable_history: bool = false,
 
         allocator: Allocator,
@@ -1425,93 +1423,6 @@ pub fn SumTree(comptime ValueT: type) type {
             for (node.children.items) |n| {
                 self.dump(n, depth + 1);
             }
-        }
-
-
-
-        /// Collects nodes with a range of the give cursor and length
-        ///
-        pub fn collect(self: *Self, cursor: TreeCursor, length: usize, bucket: *ArrayList(*TreeNode)) !TreeCursor {
-            _ = self;
-            if (length == 0) {
-                var c = cursor;
-                return c.seekRight(0, 0);
-            }
-
-            var cur = cursor;
-            const target_cursor = cur.seekRight(0, 0);
-
-            var curr_node = target_cursor.node;
-            var curr_offset = target_cursor.offset;
-            var remaining = length;
-
-            // Normalize starting offset: if curr_offset is at the end of the node, try to move to the next leaf
-            const L = curr_node.summary.dimensions[0];
-            if (curr_offset == L) {
-                if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                    curr_node = next_node;
-                    curr_offset = 0;
-                } else {
-                    const end_cur = TreeCursor{
-                        .tree = cursor.tree,
-                        .node = curr_node,
-                        .offset = curr_offset,
-                        .absolute = target_cursor.absolute,
-                    };
-                    return end_cur;
-                }
-            }
-
-            // Loop across nodes to collect them
-            while (remaining > 0) {
-                const node_size = curr_node.summary.dimensions[0];
-                const available = node_size - curr_offset;
-                const consumed = @min(remaining, available);
-
-                // Only append if it's not already the last node in the bucket to prevent duplicates
-                if (bucket.items.len == 0 or bucket.items[bucket.items.len - 1] != curr_node) {
-                    try bucket.append(cursor.tree.allocator, curr_node);
-                }
-
-                remaining -= consumed;
-                curr_offset += consumed;
-
-                if (remaining > 0) {
-                    if (TreeCursor.nextLeaf(curr_node)) |next_node| {
-                        curr_node = next_node;
-                        curr_offset = 0;
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            const end_cur = TreeCursor{
-                .tree = cursor.tree,
-                .node = curr_node,
-                .offset = curr_offset,
-                .absolute = target_cursor.absolute + (length - remaining),
-            };
-            return end_cur;
-        }
-
-        pub fn collectUntil(
-            self: *Self,
-            cursor: TreeCursor,
-            comparator: CollectComparator,
-            bucket: *ArrayList(*TreeNode),
-        ) !TreeCursor {
-            var curr_cursor = cursor;
-
-            while (true) {
-                const next_cursor = comparator(curr_cursor) orelse break;
-                if (next_cursor.isEqual(curr_cursor) or next_cursor.absolute <= curr_cursor.absolute) {
-                    break;
-                }
-                const distance = next_cursor.absolute - curr_cursor.absolute;
-                curr_cursor = try self.collect(curr_cursor, distance, bucket);
-            }
-            return curr_cursor;
         }
 
         /// Create or update a snapshot of the tree
