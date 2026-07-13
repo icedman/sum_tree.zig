@@ -123,7 +123,6 @@ fn Node(comptime ValueT: type) type {
                 if (child.summary.dimensions[0] == 0) {
                     try tree.cloneNode(self);
                     _ = self.children.orderedRemove(i);
-                    tree.destroyNode(child);
 
                     // Check contiguous leaf merge between left and right siblings
                     if (i > 0 and i < self.children.items.len) {
@@ -136,8 +135,7 @@ fn Node(comptime ValueT: type) type {
                                 try tree.cloneNode(left);
                                 left.summary = tree.summarize(tree.chunks.items[left.start .. left.start + left_L + right_L]);
                                 try tree.cloneNode(self);
-                                const sibling = self.children.orderedRemove(i);
-                                tree.destroyNode(sibling);
+                                _ = self.children.orderedRemove(i);
                             }
                         }
                     }
@@ -533,21 +531,6 @@ pub fn SumTree(comptime ValueT: type) type {
             }
         }
 
-        fn destroyNode(self: *Self, node: *TreeNode) void {
-            // Retain dangling nodes for history purposes
-            if (self.enable_history) {
-                return;
-            }
-
-            for (node.children.items) |child| {
-                self.destroyNode(child);
-            }
-            if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, node)) |idx| {
-                _ = self.nodes.orderedRemove(idx);
-            }
-            node.deinit();
-            self.allocator.destroy(node);
-        }
 
         fn cloneNode(self: *Self, target_node: *TreeNode) !void {
             if (self.enable_history) {
@@ -593,9 +576,6 @@ pub fn SumTree(comptime ValueT: type) type {
                     if (last_node_ref.* == child) {
                         last_node_ref.* = target_node;
                     }
-
-                    // Destroy child node recursively and remove it from tracking list
-                    self.destroyNode(child);
                 } else {
                     // Promote child's children to target_node
                     try self.cloneNode(target_node);
@@ -607,9 +587,6 @@ pub fn SumTree(comptime ValueT: type) type {
                     }
                     try self.cloneNode(child);
                     child.children.clearRetainingCapacity();
-
-                    // Destroy the now-empty child node
-                    self.destroyNode(child);
                 }
             }
         }
@@ -962,7 +939,6 @@ pub fn SumTree(comptime ValueT: type) type {
                             }
                             try self.markAffected(&affected_parents, p);
                         }
-                        self.destroyNode(first_node);
                     }
                     last_node = null;
                     last_offset = 0;
@@ -1057,7 +1033,6 @@ pub fn SumTree(comptime ValueT: type) type {
                                 }
                                 try self.markAffected(&affected_parents, p);
                             }
-                            self.destroyNode(node);
                         }
                     }
                 }
@@ -1171,7 +1146,6 @@ pub fn SumTree(comptime ValueT: type) type {
                                     last_node_ref.* = child;
                                     last_offset_ref.* += left_L;
                                 }
-                                self.destroyNode(sibling);
                                 continue;
                             }
                         }
