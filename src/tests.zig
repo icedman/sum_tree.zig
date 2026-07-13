@@ -588,3 +588,44 @@ test "SumTree comprehensive history and undo test (insert, erase, split, join)" 
     try std.testing.expectEqual(@as(usize, 0), tree.root.summary.dimensions[0]);
 }
 
+test "SumTree comprehensive redo test" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // Enable history tracking
+    tree.enable_history = true;
+
+    // 1. Insert "hello"
+    _ = try tree.insert("hello", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
+
+    // 2. Insert "world"
+    _ = try tree.insert("world", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
+
+    // 3. Undo "world" -> back to 5
+    try tree.undo();
+    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
+
+    // 4. Redo "world" -> forward to 10
+    try tree.redo();
+    try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
+
+    // 5. Undo "world" and "hello" -> back to 0
+    try tree.undo();
+    try tree.undo();
+    try std.testing.expectEqual(@as(usize, 0), tree.root.summary.dimensions[0]);
+
+    // 6. Redo "hello" -> forward to 5
+    try tree.redo();
+    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
+
+    // 7. Redo "world" -> forward to 10
+    try tree.redo();
+    try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
+}
+
+

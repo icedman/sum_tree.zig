@@ -354,6 +354,7 @@ pub fn SumTree(comptime ValueT: type) type {
 
         nodes: ArrayList(*TreeNode),
         clones: ArrayList(*TreeNode.Clone),
+        redo_clones: ArrayList(*TreeNode.Clone),
         root: *TreeNode = undefined,
 
         summarize: Summarizer = defaultSummarizer,
@@ -373,6 +374,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 .chunks = try TreeChunk.initCapacity(allocator, 32),
                 .nodes = try ArrayList(*TreeNode).initCapacity(allocator, 32),
                 .clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32),
+                .redo_clones = try ArrayList(*TreeNode.Clone).initCapacity(allocator, 32),
                 .root = undefined,
             };
             tree.root = try tree.createNode(&.{});
@@ -389,8 +391,13 @@ pub fn SumTree(comptime ValueT: type) type {
                 c.deinit();
                 self.allocator.destroy(c);
             }
+            for (self.redo_clones.items) |c| {
+                c.deinit();
+                self.allocator.destroy(c);
+            }
             self.nodes.deinit(self.allocator);
             self.clones.deinit(self.allocator);
+            self.redo_clones.deinit(self.allocator);
             self.chunks.deinit(self.allocator);
         }
 
@@ -702,6 +709,7 @@ pub fn SumTree(comptime ValueT: type) type {
                 return cursor;
             }
 
+            self.clearRedoHistory();
             self.updateTimestamp();
 
             if (chunk.len > Config.MAX_CHUNK_LENGTH) {
@@ -830,6 +838,7 @@ pub fn SumTree(comptime ValueT: type) type {
         /// zeroing out fully deleted leaves (dimensions[0] = 0) or truncating the start of partially deleted leaves.
         /// Balances and prunes/joins the tree structure on completion.
         pub fn erase(self: *Self, cursor_: TreeCursor, length: usize) !TreeCursor {
+            self.clearRedoHistory();
             self.updateTimestamp();
 
             var cursor = cursor_;
@@ -948,6 +957,13 @@ pub fn SumTree(comptime ValueT: type) type {
             return c;
         }
 
+        pub fn clearRedoHistory(self: *Self) void {
+            while (self.redo_clones.pop()) |c| {
+                c.deinit();
+                self.allocator.destroy(c);
+            }
+        }
+
         pub fn undo(self: *Self) !void {
             const count = self.clones.items.len;
             if (count == 0) return;
@@ -963,7 +979,20 @@ pub fn SumTree(comptime ValueT: type) type {
                 timestamp = clone.timestamp;
 
                 var shadow: *TreeNode = self.nodes.items[clone.id];
-                
+
+                // 1. Snapshot the CURRENT active state to redo_clones before overwriting it!
+                const redo_clone = try TreeNode.Clone.init(self.allocator);
+                try self.redo_clones.append(self.allocator, redo_clone);
+                redo_clone.id = shadow.id;
+                redo_clone.parent_id = shadow.parent_id;
+                redo_clone.start = shadow.start;
+                redo_clone.summary = shadow.summary;
+                for (shadow.children.items) |child| {
+                    try redo_clone.children.append(self.allocator, child.id);
+                }
+                redo_clone.timestamp = clone.timestamp;
+
+                // 2. Revert active node to the undone state
                 if (clone.parent_id) |p_id| {
                     shadow.parent = self.nodes.items[p_id];
                     shadow.parent_id = p_id;
@@ -987,6 +1016,72 @@ pub fn SumTree(comptime ValueT: type) type {
             // Pop and destroy the undone clones
             while (self.clones.items.len > i) {
                 const clone = self.clones.pop().?;
+                clone.deinit();
+                self.allocator.destroy(clone);
+            }
+
+            // Restore self.root to the topmost ancestor of the first node
+            if (self.nodes.items.len > 0) {
+                var curr = self.nodes.items[0];
+                while (curr.parent) |p| {
+                    curr = p;
+                }
+                self.root = curr;
+            }
+        }
+
+        pub fn redo(self: *Self) !void {
+            const count = self.redo_clones.items.len;
+            if (count == 0) return;
+
+            var timestamp: i64 = 0;
+            var i = count;
+
+            while (i > 0) : (i -= 1) {
+                const clone = self.redo_clones.items[i - 1];
+
+                // Stop if timestamps don’t match
+                if (timestamp != 0 and timestamp != clone.timestamp) break;
+                timestamp = clone.timestamp;
+
+                var shadow: *TreeNode = self.nodes.items[clone.id];
+
+                // 1. Snapshot the CURRENT active state back to clones (for future undo)
+                const undo_clone = try TreeNode.Clone.init(self.allocator);
+                try self.clones.append(self.allocator, undo_clone);
+                undo_clone.id = shadow.id;
+                undo_clone.parent_id = shadow.parent_id;
+                undo_clone.start = shadow.start;
+                undo_clone.summary = shadow.summary;
+                for (shadow.children.items) |child| {
+                    try undo_clone.children.append(self.allocator, child.id);
+                }
+                undo_clone.timestamp = clone.timestamp;
+
+                // 2. Re-apply the redone state
+                if (clone.parent_id) |p_id| {
+                    shadow.parent = self.nodes.items[p_id];
+                    shadow.parent_id = p_id;
+                } else {
+                    shadow.parent = null;
+                    shadow.parent_id = null;
+                }
+
+                shadow.start = clone.start;
+                shadow.summary = clone.summary;
+                shadow.children.clearRetainingCapacity();
+
+                for (clone.children.items) |item| {
+                    var child: *TreeNode = self.nodes.items[item];
+                    try shadow.children.append(shadow.allocator, child);
+                    child.parent = shadow;
+                    child.parent_id = shadow.id;
+                }
+            }
+
+            // Pop and destroy the redone clones from the redo stack
+            while (self.redo_clones.items.len > i) {
+                const clone = self.redo_clones.pop().?;
                 clone.deinit();
                 self.allocator.destroy(clone);
             }
