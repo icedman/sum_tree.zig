@@ -158,6 +158,16 @@ fn Node(comptime ValueT: type) type {
         pub fn touch(self: *Self, timestamp: i64) void {
             self.timestamp = timestamp;
         }
+
+        pub fn depth(self: *Self) usize {
+            var d: usize = 0;
+            var n = self;
+            while (n.parent) |parent| {
+                d += 1;
+                n = parent;
+            }
+            return d;
+        }
     };
 }
 
@@ -1003,6 +1013,28 @@ pub fn SumTree(comptime ValueT: type) type {
                 c.recalculate();
             }
             return c;
+        }
+
+        pub fn erase_(self: *Self, cursor_: TreeCursor, length: usize) !TreeCursor {
+            self.clearRedoHistory();
+            self.updateTimestamp();
+
+            var cursor = cursor_;
+            cursor.absolute = cursor.resolveAbsolute();
+
+            const target_cursor = cursor.seekRight(0, 0);
+            const curr_node = target_cursor.node;
+            const curr_offset = target_cursor.offset;
+            const remaining = length;
+
+            _ = .{curr_node, curr_offset, remaining};
+
+            // 1. if only a single node is affected ... modify that node, change the length (dimension[0])
+            // /  split if necessary
+            // 2. find end cursor .. 
+            // 3. modify the last node from the end cursor - change the start and length (dimension[0])
+            // 4. if first node and last node have the same parent. remove all nodes in between
+
         }
 
         /// Recomputes summaries for all nodes in the tree recursively from the root down.

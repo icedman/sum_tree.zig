@@ -909,3 +909,24 @@ test "SumTree Iterator" {
     const chunk4 = it.next();
     try std.testing.expect(chunk4 == null);
 }
+
+test "Node depth" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    const tree = try S.init(allocator);
+    defer tree.deinit();
+
+    // With only a root leaf node, depth is 0
+    try std.testing.expectEqual(@as(usize, 0), tree.root.depth());
+
+    // Setup a 2-level tree structure manually
+    const root = tree.root;
+    const child1 = try tree.createNode("abc");
+    const child2 = try tree.createNode("def");
+    try root.attach(child1);
+    try root.attach(child2);
+
+    try std.testing.expectEqual(@as(usize, 0), root.depth());
+    try std.testing.expectEqual(@as(usize, 1), child1.depth());
+    try std.testing.expectEqual(@as(usize, 1), child2.depth());
+}
