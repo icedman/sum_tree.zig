@@ -917,7 +917,7 @@ pub fn SumTree(comptime ValueT: type) type {
             var last_node: ?*TreeNode = target_end_cursor.node;
             var last_offset = target_end_cursor.offset;
 
-            // Normalize start & end boundary leaf nodes if cursors fall at very end of leaf nodes
+            // Normalize boundaries
             if (first_offset == first_node.summary.dimensions[0]) {
                 if (TreeCursor.nextLeaf(first_node)) |next_node| {
                     first_node = next_node;
@@ -926,7 +926,6 @@ pub fn SumTree(comptime ValueT: type) type {
                     return cursor;
                 }
             }
-
             if (last_node) |ln| {
                 if (last_offset == ln.summary.dimensions[0]) {
                     if (TreeCursor.nextLeaf(ln)) |next_node| {
@@ -939,199 +938,139 @@ pub fn SumTree(comptime ValueT: type) type {
                 }
             }
 
-            // Case 1: Deletion is entirely within a single leaf node
-            if (first_node == last_node) {
-                var target_N = first_node;
-                const L = target_N.summary.dimensions[0];
-                if (first_offset == 0 and last_offset == L) {
-                    try self.cloneNode(target_N);
-                    target_N.summary = .{};
-                } else if (first_offset == 0) {
-                    try self.cloneNode(target_N);
-                    target_N.start += length;
-                    target_N.summary = self.summarize(self.chunks.items[target_N.start .. target_N.start + L - length]);
-                } else if (last_offset == L) {
-                    try self.cloneNode(target_N);
-                    target_N.summary = self.summarize(self.chunks.items[target_N.start .. target_N.start + first_offset]);
-                } else {
-                    // Middle delete within a single node
-                    const right_node = try self.splitLeafNode(target_N, last_offset);
-                    _ = right_node;
-                    if (target_N == self.root) {
-                        target_N = self.root.children.items[0];
-                    }
-                    const middle_node = try self.splitLeafNode(target_N, first_offset);
-                    try self.cloneNode(middle_node);
-                    middle_node.summary = .{};
-                }
+            // Utilize collectNodes to get all nodes in the range to be deleted
+            var collected_nodes = ArrayList(*TreeNode).empty;
+            defer collected_nodes.deinit(self.allocator);
+            _ = try self.collectNodes(target_start_cursor, length, &collected_nodes);
 
-                // Bubble up updates
-                var curr_parent = target_N.parent;
-                while (curr_parent) |p| {
-                    try self.cloneNode(p);
-                    p.summarize();
-                    curr_parent = p.parent;
-                }
-
-                // Prune, collapse
-                try self.root.prune(self);
-                var dummy_last_node: ?*TreeNode = null;
-                var dummy_last_offset: usize = 0;
-                try self.collapseSingleChildNodes(self.root, &dummy_last_node, &dummy_last_offset);
-
-                // Return end cursor
-                const target_end_cursor2 = self.createCursorAt(null, 0).seekRight(cursor.absolute, 0);
-                var c = target_end_cursor2;
-                if (c.offset == c.node.summary.dimensions[0]) {
-                    if (TreeCursor.nextLeaf(c.node)) |next_node| {
-                        c.node = next_node;
-                        c.offset = 0;
-                    }
-                }
-                c.absolute = c.resolveAbsolute();
-                return c;
-            }
-
-            // Case 2: Deletion spans multiple leaf nodes
-            // Split first node if needed
-            if (first_offset > 0) {
-                first_node = try self.splitLeafNode(first_node, first_offset);
-                first_offset = 0;
-            }
-
-            // Split last node if needed
-            if (last_node) |ln| {
-                if (last_offset > 0) {
-                    last_node = try self.splitLeafNode(ln, last_offset);
-                    last_offset = 0;
-                }
-            }
-
-            // Collect affected parents
             var affected_parents = ArrayList(*TreeNode).empty;
             defer affected_parents.deinit(self.allocator);
 
-            // All nodes to be deleted are from first_node to last_node (exclusive)
-            if (first_node != last_node) {
-                const parent_first = first_node.parent;
-                const parent_last = if (last_node) |ln| ln.parent else null;
-
-                if (parent_first == null) {
-                    try self.cloneNode(self.root);
-                    self.root.summary = .{};
-                    try self.root.prune(self);
-                    var dummy_last_node: ?*TreeNode = null;
-                    var dummy_last_offset: usize = 0;
-                    try self.collapseSingleChildNodes(self.root, &dummy_last_node, &dummy_last_offset);
-                    const target_end_cursor2 = self.createCursorAt(null, 0).seekRight(cursor.absolute, 0);
-                    var c = target_end_cursor2;
-                    if (c.offset == c.node.summary.dimensions[0]) {
-                        if (TreeCursor.nextLeaf(c.node)) |next_node| {
-                            c.node = next_node;
-                            c.offset = 0;
+            if (first_node == last_node) {
+                const L = first_node.summary.dimensions[0];
+                if (first_offset == 0 and last_offset == L) {
+                    // Entire first/last node is deleted
+                    if (first_node == self.root) {
+                        try self.cloneNode(self.root);
+                        self.root.children.clearRetainingCapacity();
+                        self.root.summary = .{};
+                    } else {
+                        if (first_node.parent) |p| {
+                            try self.cloneNode(p);
+                            if (std.mem.indexOfScalar(*TreeNode, p.children.items, first_node)) |idx| {
+                                _ = p.children.orderedRemove(idx);
+                            }
+                            try self.markAffected(&affected_parents, p);
                         }
+                        self.destroyNode(first_node);
                     }
-                    c.absolute = c.resolveAbsolute();
-                    return c;
+                    last_node = null;
+                    last_offset = 0;
+                } else if (first_offset == 0) {
+                    // Keep suffix
+                    try self.cloneNode(first_node);
+                    first_node.start += last_offset;
+                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + L - last_offset]);
+                    if (first_node.parent) |p| {
+                        try self.markAffected(&affected_parents, p);
+                    }
+                } else if (last_offset == L) {
+                    // Keep prefix
+                    try self.cloneNode(first_node);
+                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + first_offset]);
+                    if (first_node.parent) |p| {
+                        try self.markAffected(&affected_parents, p);
+                    }
+                } else {
+                    // Middle delete
+                    const right_node = try self.splitLeafNode(first_node, last_offset);
+                    last_node = right_node;
+                    last_offset = 0;
+
+                    if (first_node == self.root) {
+                        first_node = self.root.children.items[0];
+                    }
+
+                    try self.cloneNode(first_node);
+                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + first_offset]);
+
+                    if (first_node.parent) |p| {
+                        try self.markAffected(&affected_parents, p);
+                    }
+                    if (right_node.parent) |p| {
+                        try self.markAffected(&affected_parents, p);
+                    }
+                }
+            } else {
+                // Different nodes: modify first and last leaf nodes, drop everything in between
+                var drop_first = false;
+                if (first_offset == 0) {
+                    drop_first = true;
+                } else {
+                    try self.cloneNode(first_node);
+                    first_node.summary = self.summarize(self.chunks.items[first_node.start .. first_node.start + first_offset]);
+                    if (first_node.parent) |p| {
+                        try self.markAffected(&affected_parents, p);
+                    }
                 }
 
-                if (parent_first == parent_last and parent_first != null) {
-                    const P = parent_first.?;
-                    const idx_first = std.mem.indexOfScalar(*TreeNode, P.children.items, first_node).?;
-                    const idx_last = if (last_node) |ln| std.mem.indexOfScalar(*TreeNode, P.children.items, ln).? else P.children.items.len;
-
-                    try self.cloneNode(P);
-                    var count = idx_last - idx_first;
-                    while (count > 0) : (count -= 1) {
-                        const child = P.children.orderedRemove(idx_first);
-                        self.destroyNode(child);
-                    }
-                    P.summarize();
-                    try self.markAffected(&affected_parents, P);
-                } else {
-                    // Different parents
-                    if (parent_first) |p_first| {
-                        const idx_first = std.mem.indexOfScalar(*TreeNode, p_first.children.items, first_node).?;
-                        try self.cloneNode(p_first);
-                        while (p_first.children.items.len > idx_first) {
-                            const child = p_first.children.orderedRemove(idx_first);
-                            self.destroyNode(child);
+                var drop_last = false;
+                if (last_node) |ln| {
+                    const L_last = ln.summary.dimensions[0];
+                    if (last_offset == L_last) {
+                        drop_last = true;
+                    } else {
+                        try self.cloneNode(ln);
+                        ln.start += last_offset;
+                        ln.summary = self.summarize(self.chunks.items[ln.start .. ln.start + L_last - last_offset]);
+                        if (ln.parent) |p| {
+                            try self.markAffected(&affected_parents, p);
                         }
-                        p_first.summarize();
-                        try self.markAffected(&affected_parents, p_first);
                     }
+                }
 
-                    if (parent_last) |p_last| {
-                        const idx_last = std.mem.indexOfScalar(*TreeNode, p_last.children.items, last_node.?).?;
-                        try self.cloneNode(p_last);
-                        var count = idx_last;
-                        while (count > 0) : (count -= 1) {
-                            const child = p_last.children.orderedRemove(0);
-                            self.destroyNode(child);
-                        }
-                        p_last.summarize();
-                        try self.markAffected(&affected_parents, p_last);
+                // Drop intermediate nodes + optionally first_node / last_node
+                for (collected_nodes.items) |node| {
+                    var should_drop = false;
+                    if (node == first_node) {
+                        should_drop = drop_first;
+                    } else if (node == last_node) {
+                        should_drop = drop_last;
+                    } else {
+                        should_drop = true;
                     }
 
-                    var curr_l = parent_first;
-                    var curr_r = parent_last;
-
-                    while (curr_l != curr_r) {
-                        if (curr_l != null and curr_r != null and curr_l.?.parent == curr_r.?.parent) {
-                            if (curr_l.?.parent) |P| {
-                                const idx_l = std.mem.indexOfScalar(*TreeNode, P.children.items, curr_l.?).?;
-                                const idx_r = std.mem.indexOfScalar(*TreeNode, P.children.items, curr_r.?).?;
-                                try self.cloneNode(P);
-                                var count = idx_r - idx_l - 1;
-                                while (count > 0) : (count -= 1) {
-                                    const child = P.children.orderedRemove(idx_l + 1);
-                                    self.destroyNode(child);
-                                }
-                                P.summarize();
-                                try self.markAffected(&affected_parents, P);
-                            }
-                            break;
+                    if (should_drop) {
+                        if (node == last_node) {
+                            last_node = null;
+                            last_offset = 0;
                         }
-
-                        if (curr_l orelse null) |l| {
-                            if (l.parent) |p_l| {
-                                const idx = std.mem.indexOfScalar(*TreeNode, p_l.children.items, l).?;
-                                try self.cloneNode(p_l);
-                                while (p_l.children.items.len > idx + 1) {
-                                    const child = p_l.children.orderedRemove(idx + 1);
-                                    self.destroyNode(child);
+                        if (node == self.root) {
+                            try self.cloneNode(self.root);
+                            self.root.children.clearRetainingCapacity();
+                            self.root.summary = .{};
+                        } else {
+                            if (node.parent) |p| {
+                                try self.cloneNode(p);
+                                if (std.mem.indexOfScalar(*TreeNode, p.children.items, node)) |idx| {
+                                    _ = p.children.orderedRemove(idx);
                                 }
-                                p_l.summarize();
-                                try self.markAffected(&affected_parents, p_l);
-                                curr_l = p_l;
-                            } else {
-                                curr_l = null;
+                                try self.markAffected(&affected_parents, p);
                             }
-                        }
-
-                        if (curr_r orelse null) |r| {
-                            if (r.parent) |p_r| {
-                                const idx = std.mem.indexOfScalar(*TreeNode, p_r.children.items, r).?;
-                                try self.cloneNode(p_r);
-                                var count = idx;
-                                while (count > 0) : (count -= 1) {
-                                    const child = p_r.children.orderedRemove(0);
-                                    self.destroyNode(child);
-                                }
-                                p_r.summarize();
-                                try self.markAffected(&affected_parents, p_r);
-                                curr_r = p_r;
-                            } else {
-                                curr_r = null;
-                            }
+                            self.destroyNode(node);
                         }
                     }
                 }
             }
 
-            // Bubble up updates from remaining affected parents
+            // Re-summarize affected parents
             for (affected_parents.items) |parent| {
-                var curr_parent = parent.parent;
+                parent.summarize();
+            }
+
+            // Bubble up updates
+            for (affected_parents.items) |parent| {
+                var curr_parent: ?*TreeNode = parent;
                 while (curr_parent) |p| {
                     try self.cloneNode(p);
                     p.summarize();
@@ -1139,37 +1078,39 @@ pub fn SumTree(comptime ValueT: type) type {
                 }
             }
 
-            // Prune zero-length nodes recursively from the root down
+            // Prune zero-length nodes recursively
             try self.root.prune(self);
 
-            // Join sibling nodes recursively
+            // Join siblings recursively
             for (affected_parents.items) |parent| {
                 if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, parent) != null) {
                     try self.joinInternalNodes(parent);
                 }
             }
 
-            // Merge contiguous sibling leaf nodes under all affected parents
+            // Merge contiguous sibling leaf nodes
+            var last_node_ref = last_node;
+            var last_offset_ref = last_offset;
             for (affected_parents.items) |parent| {
                 if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, parent) != null) {
-                    try self.mergeContiguousLeaves(parent, &last_node, &last_offset);
+                    try self.mergeContiguousLeaves(parent, &last_node_ref, &last_offset_ref);
                 }
             }
 
-            // Collapse redundant single-child internal nodes recursively
-            try self.collapseSingleChildNodes(self.root, &last_node, &last_offset);
+            // Collapse redundant single-child internal nodes
+            try self.collapseSingleChildNodes(self.root, &last_node_ref, &last_offset_ref);
 
-            // Find rightmost leaf node for end cursor if last_node is null
+            // Find rightmost leaf node for end cursor if last_node_ref is null
             var curr_rightmost = self.root;
             while (!curr_rightmost.isLeaf()) {
                 curr_rightmost = curr_rightmost.children.items[curr_rightmost.children.items.len - 1];
             }
 
             // Return end cursor
-            var c = if (last_node) |ln| TreeCursor{
+            var c = if (last_node_ref) |ln| TreeCursor{
                 .tree = self,
                 .node = ln,
-                .offset = last_offset,
+                .offset = last_offset_ref,
                 .absolute = 0,
             } else TreeCursor{
                 .tree = self,
@@ -1180,7 +1121,7 @@ pub fn SumTree(comptime ValueT: type) type {
             c.absolute = c.resolveAbsolute();
 
             var is_detached = true;
-            if (last_node) |ln| {
+            if (last_node_ref) |ln| {
                 if (std.mem.indexOfScalar(*TreeNode, self.nodes.items, ln) != null) {
                     is_detached = false;
                     if (ln.parent) |p| {

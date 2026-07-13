@@ -51,8 +51,8 @@ This document outlines key observations on the current `SumTree` B+ tree impleme
 ---
 
 ## 5. Iterators
-* Currently, to traverse all values in the tree, users must manually create cursors, seek, and loop using the internal helper `nextLeaf`.
-* **Missing Feature**: Provide a clean, idiomatic Zig iterator struct:
+* **Status**: **Completed**
+* An idiomatic, clean Zig iterator is implemented for tree traversal:
   ```zig
   var it = tree.iterator();
   while (it.next()) |chunk| { ... }
@@ -80,3 +80,13 @@ To implement an efficient `Rope` structure (an editable sequence representing a 
      - `var right = split_right.split(end - start)` (splits `mid_right` into `mid` and `right`).
      - The `mid` tree represents the desired sub-string, and we can concatenate `left` and `right` back together to keep the original intact.
      - All of this runs in $O(\log N)$ time instead of $O(N)$ copying.
+
+---
+
+## 7. Range Collection & Structural Range Deletion
+* **Status**: **Completed**
+* **Range Collection**:
+  - `collectLeaves`: Sequentially collects all leaf nodes in a range by walking the leaves using `nextLeaf`.
+  - `collectNodes`: Optimally collects leaf and internal nodes in $O(\log N)$ time. It skips descending into subtrees whose total length fits completely within the remaining collection distance.
+* **Structural Range Deletion (`erase`)**:
+  - Reimplemented `erase` to use `collectNodes`. This collects all fully covered internal/leaf nodes in the deletion range and detaches them from their parents in $O(\log N)$ time, avoiding manually stepping through parent/sibling indices.
