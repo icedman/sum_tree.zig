@@ -628,4 +628,25 @@ test "SumTree comprehensive redo test" {
     try std.testing.expectEqual(@as(usize, 10), tree.root.summary.dimensions[0]);
 }
 
+test "SumTree initWithChunk (unmanaged chunks)" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+
+    // Create an external TreeChunk array
+    var tree_chunks = std.ArrayList(u8).empty;
+    defer tree_chunks.deinit(allocator);
+
+    const tree = try S.initWithChunk(allocator, &tree_chunks);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqual(tree.managed_chunks, false);
+
+    // Do some insertions
+    _ = try tree.insert("hello", tree.createCursor());
+    try std.testing.expectEqual(@as(usize, 5), tree.root.summary.dimensions[0]);
+    try std.testing.expectEqualSlices(u8, "hello", tree_chunks.items);
+}
+
+
 
