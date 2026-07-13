@@ -930,3 +930,69 @@ test "Node depth" {
     try std.testing.expectEqual(@as(usize, 1), child1.depth());
     try std.testing.expectEqual(@as(usize, 1), child2.depth());
 }
+
+test "SumTree erase_v2 vs erase comparison fuzz test" {
+    const allocator = std.heap.page_allocator;
+    const S = SumTree(u8);
+    
+    const tree_v1 = try S.init(allocator);
+    defer tree_v1.deinit();
+
+    const tree_v2 = try S.init(allocator);
+    defer tree_v2.deinit();
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const rand = prng.random();
+
+    // 1. Populate both trees identically
+    var word_buf: [16]u8 = undefined;
+    for (0..200) |_| {
+        const word = randomWord(rand, &word_buf);
+        
+        const total_len = tree_v1.root.summary.dimensions[0];
+        const pos = if (total_len == 0) 0 else rand.intRangeAtMost(usize, 0, total_len);
+        
+        const cur1 = tree_v1.createCursor().seekRight(pos, 0);
+        _ = try tree_v1.insert(word, cur1);
+
+        const cur2 = tree_v2.createCursor().seekRight(pos, 0);
+        _ = try tree_v2.insert(word, cur2);
+    }
+
+    // Verify initial consistency
+    try std.testing.expectEqual(tree_v1.root.summary.dimensions[0], tree_v2.root.summary.dimensions[0]);
+
+    // 2. Erase from both trees at identical positions
+    for (0..500) |_| {
+        const total_len = tree_v1.root.summary.dimensions[0];
+        if (total_len == 0) break;
+
+        const pos = rand.intRangeLessThan(usize, 0, total_len);
+        const len = rand.intRangeAtMost(usize, 1, @min(15, total_len - pos));
+
+        // Erase using v1
+        const cur1 = tree_v1.createCursor().seekRight(pos, 0);
+        const res_cur1 = try tree_v1.erase(cur1, len);
+
+        // Erase using v2
+        const cur2 = tree_v2.createCursor().seekRight(pos, 0);
+        const res_cur2 = try tree_v2.erase_v2(cur2, len);
+
+        // Verify summary and cursor consistency in this step
+        try std.testing.expectEqual(tree_v1.root.summary.dimensions[0], tree_v2.root.summary.dimensions[0]);
+        try std.testing.expectEqual(res_cur1.resolveAbsolute(), res_cur2.resolveAbsolute());
+
+        // Verify contents of the trees
+        var it1 = tree_v1.iterator();
+        var it2 = tree_v2.iterator();
+        while (true) {
+            const c1 = it1.next();
+            const c2 = it2.next();
+            if (c1 == null or c2 == null) {
+                try std.testing.expect(c1 == null and c2 == null);
+                break;
+            }
+            try std.testing.expectEqualSlices(u8, c1.?, c2.?);
+        }
+    }
+}
