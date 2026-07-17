@@ -42,6 +42,7 @@ pub fn main(init: std.process.Init) !void {
         rope = try Rope.init(allocator);
     }
     defer rope.deinit();
+    rope.setEnableHistory(true);
 
     // 2. Initialize TUI helper (handles Raw mode)
     var tui = try Tui.init(io, allocator);
