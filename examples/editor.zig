@@ -609,9 +609,31 @@ pub fn main(init: std.process.Init) !void {
             },
             .char => |ch| {
                 const seq = ch.buf[0..ch.len];
-                if (current_mode == .normal) {
+                if (current_mode == .normal or current_mode == .visual or current_mode == .visual_line) {
                     if (seq.len == 1) {
                         const c = seq[0];
+                        if (current_mode == .visual or current_mode == .visual_line) {
+                            if (c == 'd' or c == 'x') {
+                                if (selection_manager.getPrimary()) |sel| {
+                                    try rope.delete(sel.start(), sel.end() - sel.start());
+                                    current_mode = .normal;
+                                    try ed_ctx.onEdit();
+                                    const total_char = rope.tree.root.summary.char_len;
+                                    cursor_pos = rope.offsetToPoint(@min(sel.start(), total_char));
+                                    force_render = true;
+                                }
+                                continue;
+                            }
+                            if (c == 'h' or c == 'j' or c == 'k' or c == 'l' or
+                                c == '0' or c == '$' or c == '^' or
+                                c == '{' or c == '}' or c == 'g' or c == 'G' or
+                                c == 'v' or c == 'V' or c == ':')
+                            {
+                                // fall through
+                            } else {
+                                continue;
+                            }
+                        }
                         if (pending_op) |op| {
                             if (op == 'd' and c == 'd') {
                                 // dd: delete current line
@@ -851,13 +873,21 @@ pub fn main(init: std.process.Init) !void {
                                     force_render = true;
                                 },
                                 'v' => {
-                                    current_mode = .visual;
-                                    visual_anchor_pos = cursor_pos;
+                                    if (current_mode == .visual) {
+                                        current_mode = .normal;
+                                    } else {
+                                        current_mode = .visual;
+                                        visual_anchor_pos = cursor_pos;
+                                    }
                                     force_render = true;
                                 },
                                 'V' => {
-                                    current_mode = .visual_line;
-                                    visual_anchor_pos = cursor_pos;
+                                    if (current_mode == .visual_line) {
+                                        current_mode = .normal;
+                                    } else {
+                                        current_mode = .visual_line;
+                                        visual_anchor_pos = cursor_pos;
+                                    }
                                     force_render = true;
                                 },
                                 ':' => {
