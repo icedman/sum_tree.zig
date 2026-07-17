@@ -165,6 +165,91 @@ pub fn SumTree(comptime Item: type) type {
             return tree;
         }
 
+        pub fn initFromSlice(allocator: Allocator, items: []const Item, cx: Summary.Context) !*Self {
+            const tree = try allocator.create(Self);
+            errdefer allocator.destroy(tree);
+
+            if (items.len == 0) {
+                const root = try Node.initLeaf(allocator, cx);
+                tree.* = .{
+                    .allocator = allocator,
+                    .root = root,
+                    .cx = cx,
+                    .history = std.ArrayList(*Node).empty,
+                };
+                return tree;
+            }
+
+            var nodes = std.ArrayList(*Node).empty;
+            defer {
+                for (nodes.items) |n| {
+                    n.deref(allocator);
+                }
+                nodes.deinit(allocator);
+            }
+
+            var i: usize = 0;
+            while (i < items.len) {
+                const chunk_size = @min(items.len - i, MAX_CHILDREN);
+                const leaf = try Node.initLeaf(allocator, cx);
+                errdefer leaf.deref(allocator);
+
+                var leaf_summary = Summary.zero(cx);
+                for (items[i .. i + chunk_size]) |item| {
+                    leaf.children.leaf.append(item);
+                    leaf_summary.addSummary(item.summary(cx), cx);
+                }
+                leaf.summary = leaf_summary;
+                try nodes.append(allocator, leaf);
+                i += chunk_size;
+            }
+
+            var parent_nodes = std.ArrayList(*Node).empty;
+            defer {
+                for (parent_nodes.items) |n| {
+                    n.deref(allocator);
+                }
+                parent_nodes.deinit(allocator);
+            }
+
+            var height: usize = 1;
+            while (nodes.items.len > 1) {
+                parent_nodes.clearRetainingCapacity();
+                var j: usize = 0;
+                while (j < nodes.items.len) {
+                    const chunk_size = @min(nodes.items.len - j, MAX_CHILDREN);
+                    const parent = try Node.initInternal(allocator, height, cx);
+                    errdefer parent.deref(allocator);
+
+                    var parent_summary = Summary.zero(cx);
+                    for (nodes.items[j .. j + chunk_size]) |child| {
+                        parent.children.internal.append(child);
+                        parent_summary.addSummary(child.summary, cx);
+                        nodes.items[j] = undefined;
+                    }
+                    parent.summary = parent_summary;
+                    try parent_nodes.append(allocator, parent);
+                    j += chunk_size;
+                }
+
+                nodes.clearRetainingCapacity();
+                try nodes.appendSlice(allocator, parent_nodes.items);
+                parent_nodes.clearRetainingCapacity();
+                height += 1;
+            }
+
+            const root_node = nodes.items[0];
+            nodes.clearRetainingCapacity();
+
+            tree.* = .{
+                .allocator = allocator,
+                .root = root_node,
+                .cx = cx,
+                .history = std.ArrayList(*Node).empty,
+            };
+            return tree;
+        }
+
         pub fn deinit(self: *Self) void {
             self.root.deref(self.allocator);
             for (self.history.items) |node| {

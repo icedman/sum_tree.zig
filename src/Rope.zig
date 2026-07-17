@@ -145,6 +145,32 @@ pub const Rope = struct {
         return rope;
     }
 
+    pub fn initFromString(allocator: Allocator, content: []const u8) !*Self {
+        if (content.len == 0) {
+            return try init(allocator);
+        }
+        const chunk_count = (content.len + 127) / 128;
+        const chunks = try allocator.alloc(RopeChunk, chunk_count);
+        defer allocator.free(chunks);
+
+        var idx: usize = 0;
+        var chunk_idx: usize = 0;
+        while (idx < content.len) {
+            const chunk_size = @min(content.len - idx, 128);
+            var c = RopeChunk{};
+            c.text.appendSlice(content[idx .. idx + chunk_size]);
+            chunks[chunk_idx] = c;
+            chunk_idx += 1;
+            idx += chunk_size;
+        }
+
+        const tree = try S.initFromSlice(allocator, chunks, {});
+        const rope = try allocator.create(Self);
+        rope.tree = tree;
+        rope.allocator = allocator;
+        return rope;
+    }
+
     pub fn deinit(self: *Self) void {
         self.tree.deinit();
         self.allocator.destroy(self);
@@ -210,13 +236,34 @@ pub const Rope = struct {
             }
         }
 
-        var i: usize = 0;
-        while (i < content.len) {
-            const chunk_size = @min(content.len - i, 128);
-            var c = RopeChunk{};
-            c.text.appendSlice(content[i .. i + chunk_size]);
-            try left_slice.push(c);
-            i += chunk_size;
+        if (content.len > 4096) {
+            const chunk_count = (content.len + 127) / 128;
+            const chunks = try self.allocator.alloc(RopeChunk, chunk_count);
+            defer self.allocator.free(chunks);
+
+            var idx: usize = 0;
+            var chunk_idx: usize = 0;
+            while (idx < content.len) {
+                const chunk_size = @min(content.len - idx, 128);
+                var c = RopeChunk{};
+                c.text.appendSlice(content[idx .. idx + chunk_size]);
+                chunks[chunk_idx] = c;
+                chunk_idx += 1;
+                idx += chunk_size;
+            }
+
+            const temp_tree = try S.initFromSlice(self.allocator, chunks, {});
+            defer temp_tree.deinit();
+            try left_slice.append(temp_tree);
+        } else {
+            var i: usize = 0;
+            while (i < content.len) {
+                const chunk_size = @min(content.len - i, 128);
+                var c = RopeChunk{};
+                c.text.appendSlice(content[i .. i + chunk_size]);
+                try left_slice.push(c);
+                i += chunk_size;
+            }
         }
 
         if (del_right_chunk) |c| {

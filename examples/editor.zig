@@ -19,9 +19,6 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next(); // skips the executable name
     const filename = args.next() orelse "untitled.txt";
 
-    const rope = try Rope.init(allocator);
-    defer rope.deinit();
-
     // 1. Load file if it exists
     var file_content: ?[]u8 = null;
     if (std.Io.Dir.cwd().openFile(io, filename, .{})) |file| {
@@ -38,11 +35,13 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (file_content) |content| allocator.free(content);
 
-    rope.setEnableHistory(false);
+    var rope: *Rope = undefined;
     if (file_content) |content| {
-        try rope.insert(0, content);
+        rope = try Rope.initFromString(allocator, content);
+    } else {
+        rope = try Rope.init(allocator);
     }
-    rope.setEnableHistory(true);
+    defer rope.deinit();
 
     // 2. Initialize TUI helper (handles Raw mode)
     var tui = try Tui.init(io, allocator);
