@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
 
 pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
     return struct {
@@ -17,6 +16,12 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
             self.len += 1;
         }
 
+        pub fn appendSlice(self: *BSelf, items: []const T) void {
+            for (items) |item| {
+                self.append(item);
+            }
+        }
+
         pub fn insert(self: *BSelf, idx: usize, item: T) void {
             var i: usize = self.len;
             while (i > idx) : (i -= 1) {
@@ -26,7 +31,7 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
             self.len += 1;
         }
 
-        pub fn slice(self: BSelf) []const T {
+        pub fn slice(self: *const BSelf) []const T {
             return self.data[0..self.len];
         }
 
@@ -36,51 +41,45 @@ pub fn BoundedArray(comptime T: type, comptime capacity: usize) type {
     };
 }
 
-pub fn SumTree(comptime ValueT: type) type {
+pub const Bias = enum {
+    left,
+    right,
+};
+
+pub fn SumTree(comptime Item: type) type {
+    const Summary = Item.Summary;
     return struct {
         const Self = @This();
         pub const MAX_CHILDREN = 8;
         pub const MIN_CHILDREN = MAX_CHILDREN / 2;
 
-        pub const Summary = struct {
-            dimensions: [1]usize = .{0},
-
-            pub fn zero() Summary {
-                return .{ .dimensions = .{0} };
-            }
-
-            pub fn add(self: *Summary, other: Summary) void {
-                self.dimensions[0] += other.dimensions[0];
-            }
-        };
-
         pub const Node = struct {
             rc: usize = 1,
             height: usize = 0,
-            summary: Summary = Summary.zero(),
-            start: usize = 0,
-            children: BoundedArray(*Node, MAX_CHILDREN) = .{},
+            summary: Summary,
+            children: union(enum) {
+                internal: BoundedArray(*Node, MAX_CHILDREN),
+                leaf: BoundedArray(Item, MAX_CHILDREN),
+            },
 
-            pub fn initLeaf(allocator: Allocator) !*Node {
+            pub fn initLeaf(allocator: Allocator, cx: Summary.Context) !*Node {
                 const node = try allocator.create(Node);
                 node.* = .{
                     .rc = 1,
                     .height = 0,
-                    .summary = Summary.zero(),
-                    .start = 0,
-                    .children = .{},
+                    .summary = Summary.zero(cx),
+                    .children = .{ .leaf = .{} },
                 };
                 return node;
             }
 
-            pub fn initInternal(allocator: Allocator, height: usize) !*Node {
+            pub fn initInternal(allocator: Allocator, height: usize, cx: Summary.Context) !*Node {
                 const node = try allocator.create(Node);
                 node.* = .{
                     .rc = 1,
                     .height = height,
-                    .summary = Summary.zero(),
-                    .start = 0,
-                    .children = .{},
+                    .summary = Summary.zero(cx),
+                    .children = .{ .internal = .{} },
                 };
                 return node;
             }
@@ -97,10 +96,13 @@ pub fn SumTree(comptime ValueT: type) type {
             pub fn deref(self: *Node, allocator: Allocator) void {
                 self.rc -= 1;
                 if (self.rc == 0) {
-                    if (self.height > 0) {
-                        for (self.children.slice()) |child| {
-                            child.deref(allocator);
-                        }
+                    switch (self.children) {
+                        .internal => |internal| {
+                            for (internal.slice()) |child| {
+                                child.deref(allocator);
+                            }
+                        },
+                        .leaf => {},
                     }
                     allocator.destroy(self);
                 }
@@ -112,55 +114,63 @@ pub fn SumTree(comptime ValueT: type) type {
                     .rc = 1,
                     .height = self.height,
                     .summary = self.summary,
-                    .start = self.start,
                     .children = self.children,
                 };
-                if (self.height > 0) {
-                    for (copy.children.slice()) |child| {
-                        _ = child.ref();
-                    }
+                switch (copy.children) {
+                    .internal => |internal| {
+                        for (internal.slice()) |child| {
+                            _ = child.ref();
+                        }
+                    },
+                    .leaf => {},
                 }
                 return copy;
             }
 
-            pub fn summarize(self: *Node) void {
-                self.summary = Summary.zero();
-                if (self.isLeaf()) {
-                    // Leaf summary is preserved directly (updated during split/slice)
-                } else {
-                    for (self.children.slice()) |child| {
-                        self.summary.add(child.summary);
-                    }
+            pub fn summarize(self: *Node, cx: Summary.Context) void {
+                self.summary = Summary.zero(cx);
+                switch (self.children) {
+                    .internal => |internal| {
+                        for (internal.slice()) |child| {
+                            self.summary.add(child.summary, cx);
+                        }
+                    },
+                    .leaf => |leaf| {
+                        for (leaf.slice()) |it| {
+                            self.summary.add(it.summary(cx), cx);
+                        }
+                    },
                 }
             }
         };
 
         allocator: Allocator,
         root: *Node,
-        chunks: *std.ArrayList(u8),
-        managed_chunks: bool = true,
+        cx: Summary.Context,
 
-        pub fn init(allocator: Allocator) !*Self {
+        enable_history: bool = false,
+        history_index: usize = 0,
+        in_transaction: bool = false,
+        history: std.ArrayList(*Node),
+
+        pub fn init(allocator: Allocator, cx: Summary.Context) !*Self {
             const tree = try allocator.create(Self);
-            const root = try Node.initLeaf(allocator);
-            const chunks = try allocator.create(std.ArrayList(u8));
-            chunks.* = std.ArrayList(u8).empty;
-
+            const root = try Node.initLeaf(allocator, cx);
             tree.* = .{
                 .allocator = allocator,
                 .root = root,
-                .chunks = chunks,
-                .managed_chunks = true,
+                .cx = cx,
+                .history = std.ArrayList(*Node).empty,
             };
             return tree;
         }
 
         pub fn deinit(self: *Self) void {
             self.root.deref(self.allocator);
-            if (self.managed_chunks) {
-                self.chunks.deinit(self.allocator);
-                self.allocator.destroy(self.chunks);
+            for (self.history.items) |node| {
+                node.deref(self.allocator);
             }
+            self.history.deinit(self.allocator);
             self.allocator.destroy(self);
         }
 
@@ -169,433 +179,780 @@ pub fn SumTree(comptime ValueT: type) type {
             copy.* = .{
                 .allocator = self.allocator,
                 .root = self.root.ref(),
-                .chunks = self.chunks,
-                .managed_chunks = false,
+                .cx = self.cx,
+                .history = std.ArrayList(*Node).empty,
             };
             return copy;
         }
 
-        fn makeMut(self: *Self, node_ptr: **Node) !void {
-            const node = node_ptr.*;
-            if (node.rc > 1) {
-                const copy = try node.clone(self.allocator);
-                node.deref(self.allocator);
-                node_ptr.* = copy;
+        pub fn isEmpty(self: *const Self) bool {
+            return self.root.isLeaf() and self.root.children.leaf.len == 0;
+        }
+
+        pub fn startTransaction(self: *Self) !void {
+            if (self.enable_history and self.history.items.len == 0) {
+                try self.history.append(self.allocator, self.root.ref());
             }
         }
 
-        fn joinNodes(self: *Self, left_ptr: **Node, right_ptr: **Node) !?*Node {
-            var left = left_ptr.*;
-            var right = right_ptr.*;
+        pub fn saveHistory(self: *Self) !void {
+            while (self.history.items.len > self.history_index + 1) {
+                const node = self.history.pop().?;
+                node.deref(self.allocator);
+            }
+            try self.history.append(self.allocator, self.root.ref());
+            self.history_index = self.history.items.len - 1;
+        }
 
+        pub fn undo(self: *Self) !void {
+            if (!self.enable_history) return error.HistoryDisabled;
+            if (self.history_index == 0) return;
+
+            self.history_index -= 1;
+            const old = self.root;
+            self.root = self.history.items[self.history_index].ref();
+            old.deref(self.allocator);
+        }
+
+        pub fn redo(self: *Self) !void {
+            if (!self.enable_history) return error.HistoryDisabled;
+            if (self.history_index >= self.history.items.len - 1) return;
+
+            self.history_index += 1;
+            const old = self.root;
+            self.root = self.history.items[self.history_index].ref();
+            old.deref(self.allocator);
+        }
+
+        pub const SplitResult = struct {
+            left: *Self,
+            right: *Self,
+        };
+
+        const SplitNodes = struct {
+            left: *Node,
+            right: *Node,
+        };
+
+        pub fn split(self: *Self, comptime Dim: type, target: anytype, bias: Bias) !SplitResult {
+            var position = Dim.zero(self.cx);
+            const res = try self.splitNode(Dim, self.root, target, bias, &position);
+
+            const left_tree = try self.allocator.create(Self);
+            left_tree.* = .{
+                .allocator = self.allocator,
+                .root = res.left,
+                .cx = self.cx,
+                .history = std.ArrayList(*Node).empty,
+            };
+
+            const right_tree = try self.allocator.create(Self);
+            right_tree.* = .{
+                .allocator = self.allocator,
+                .root = res.right,
+                .cx = self.cx,
+                .history = std.ArrayList(*Node).empty,
+            };
+
+            return .{ .left = left_tree, .right = right_tree };
+        }
+
+        fn collapseNode(self: *Self, node: *Node) !*Node {
+            var curr = node;
+            while (!curr.isLeaf() and curr.children.internal.len == 1) {
+                const child = curr.children.internal.data[0].ref();
+                curr.deref(self.allocator);
+                curr = child;
+            }
+            if (!curr.isLeaf() and curr.children.internal.len == 0) {
+                const empty_leaf = try Node.initLeaf(self.allocator, self.cx);
+                curr.deref(self.allocator);
+                curr = empty_leaf;
+            }
+            return curr;
+        }
+
+        fn splitNode(self: *Self, comptime Dim: type, node: *Node, target: anytype, bias: Bias, position: *Dim) anyerror!SplitNodes {
+            const res = try self.splitNodeRec(Dim, node, target, bias, position);
+            errdefer {
+                res.left.deref(self.allocator);
+                res.right.deref(self.allocator);
+            }
+            const left_collapsed = try self.collapseNode(res.left);
+            errdefer left_collapsed.deref(self.allocator);
+            const right_collapsed = try self.collapseNode(res.right);
+            return .{ .left = left_collapsed, .right = right_collapsed };
+        }
+
+        fn splitNodeRec(self: *Self, comptime Dim: type, node: *Node, target: anytype, bias: Bias, position: *Dim) anyerror!SplitNodes {
+            if (node.isLeaf()) {
+                const left = try Node.initLeaf(self.allocator, self.cx);
+                const right = try Node.initLeaf(self.allocator, self.cx);
+                errdefer {
+                    left.deref(self.allocator);
+                    right.deref(self.allocator);
+                }
+
+                var split_idx: ?usize = null;
+                for (node.children.leaf.slice(), 0..) |item, idx| {
+                    var item_end = position.*;
+                    item_end.addSummary(item.summary(self.cx), self.cx);
+                    const order = target.cmp(item_end, self.cx);
+                    if (order == .lt or (order == .eq and bias == .left)) {
+                        split_idx = idx;
+                        break;
+                    } else {
+                        left.children.leaf.append(item);
+                        position.* = item_end;
+                    }
+                }
+
+                if (split_idx) |idx| {
+                    for (node.children.leaf.slice()[idx..]) |item| {
+                        right.children.leaf.append(item);
+                    }
+                }
+
+                left.summarize(self.cx);
+                right.summarize(self.cx);
+                return .{ .left = left, .right = right };
+            } else {
+                const left = try Node.initInternal(self.allocator, node.height, self.cx);
+                const right = try Node.initInternal(self.allocator, node.height, self.cx);
+                errdefer {
+                    left.deref(self.allocator);
+                    right.deref(self.allocator);
+                }
+
+                var split_idx: ?usize = null;
+                var child_res: ?SplitNodes = null;
+
+                for (node.children.internal.slice(), 0..) |child, idx| {
+                    var child_end = position.*;
+                    child_end.addSummary(child.summary, self.cx);
+                    const order = target.cmp(child_end, self.cx);
+                    if (order == .lt or (order == .eq and bias == .left)) {
+                        split_idx = idx;
+                        child_res = try self.splitNodeRec(Dim, child, target, bias, position);
+                        break;
+                    } else {
+                        left.children.internal.append(child.ref());
+                        position.* = child_end;
+                    }
+                }
+
+                if (split_idx) |idx| {
+                    if (child_res.?.left.isLeaf() and child_res.?.left.children.leaf.len > 0) {
+                        left.children.internal.append(child_res.?.left);
+                    } else if (!child_res.?.left.isLeaf() and child_res.?.left.children.internal.len > 0) {
+                        left.children.internal.append(child_res.?.left);
+                    } else {
+                        child_res.?.left.deref(self.allocator);
+                    }
+
+                    if (child_res.?.right.isLeaf() and child_res.?.right.children.leaf.len > 0) {
+                        right.children.internal.append(child_res.?.right);
+                    } else if (!child_res.?.right.isLeaf() and child_res.?.right.children.internal.len > 0) {
+                        right.children.internal.append(child_res.?.right);
+                    } else {
+                        child_res.?.right.deref(self.allocator);
+                    }
+
+                    for (node.children.internal.slice()[idx + 1 ..]) |child| {
+                        right.children.internal.append(child.ref());
+                    }
+                }
+
+                left.summarize(self.cx);
+                right.summarize(self.cx);
+
+                return .{ .left = left, .right = right };
+            }
+        }
+
+        fn toMut(self: *Self, node: *Node) !*Node {
+            if (node.rc > 1) {
+                const copy = try node.clone(self.allocator);
+                node.deref(self.allocator);
+                return copy;
+            }
+            return node;
+        }
+
+        const JoinResult = struct {
+            left: *Node,
+            right: ?*Node,
+        };
+
+        fn joinNodes(self: *Self, left: *Node, right: *Node) !JoinResult {
             if (left.height == right.height) {
                 if (left.height == 0) {
-                    const left_L = left.summary.dimensions[0];
-                    if (left.start + left_L == right.start) {
-                        try self.makeMut(left_ptr);
-                        left_ptr.*.summary.dimensions[0] += right.summary.dimensions[0];
+                    const total_items = left.children.leaf.len + right.children.leaf.len;
+                    if (total_items <= MAX_CHILDREN) {
+                        const mut_left = try self.toMut(left);
+                        for (right.children.leaf.slice()) |item| {
+                            mut_left.children.leaf.append(item);
+                        }
+                        mut_left.summarize(self.cx);
                         right.deref(self.allocator);
-                        return null;
+                        return .{ .left = mut_left, .right = null };
                     } else {
-                        return right;
+                        var all_items = BoundedArray(Item, MAX_CHILDREN * 2).empty();
+                        for (left.children.leaf.slice()) |item| {
+                            all_items.append(item);
+                        }
+                        for (right.children.leaf.slice()) |item| {
+                            all_items.append(item);
+                        }
+
+                        const midpoint = all_items.len / 2;
+                        const mut_left = try self.toMut(left);
+                        mut_left.children.leaf.len = 0;
+                        for (all_items.slice()[0..midpoint]) |item| {
+                            mut_left.children.leaf.append(item);
+                        }
+                        mut_left.summarize(self.cx);
+
+                        const split_sibling = try Node.initLeaf(self.allocator, self.cx);
+                        for (all_items.slice()[midpoint..]) |item| {
+                            split_sibling.children.leaf.append(item);
+                        }
+                        split_sibling.summarize(self.cx);
+
+                        right.deref(self.allocator);
+                        return .{ .left = mut_left, .right = split_sibling };
                     }
                 } else {
-                    const total_children = left.children.len + right.children.len;
+                    const total_children = left.children.internal.len + right.children.internal.len;
                     if (total_children <= MAX_CHILDREN) {
-                        try self.makeMut(left_ptr);
-                        left = left_ptr.*;
-                        for (right.children.slice()) |child| {
-                            left.children.append(child.ref());
+                        const mut_left = try self.toMut(left);
+                        for (right.children.internal.slice()) |child| {
+                            mut_left.children.internal.append(child.ref());
                         }
-                        left.summarize();
+                        mut_left.summarize(self.cx);
                         right.deref(self.allocator);
-                        return null;
+                        return .{ .left = mut_left, .right = null };
                     } else {
-                        try self.makeMut(left_ptr);
-                        left = left_ptr.*;
-
                         var all_children = BoundedArray(*Node, MAX_CHILDREN * 2).empty();
-                        for (left.children.slice()) |child| {
+                        for (left.children.internal.slice()) |child| {
                             all_children.append(child.ref());
                         }
-                        for (right.children.slice()) |child| {
+                        for (right.children.internal.slice()) |child| {
                             all_children.append(child.ref());
                         }
 
                         const midpoint = all_children.len / 2;
-
-                        for (left.children.slice()) |child| {
+                        const mut_left = try self.toMut(left);
+                        for (mut_left.children.internal.slice()) |child| {
                             child.deref(self.allocator);
                         }
-                        left.children.len = 0;
+                        mut_left.children.internal.len = 0;
                         for (all_children.slice()[0..midpoint]) |child| {
-                            left.children.append(child);
+                            mut_left.children.internal.append(child);
                         }
-                        left.summarize();
+                        mut_left.summarize(self.cx);
 
-                        const split_sibling = try Node.initInternal(self.allocator, left.height);
+                        const split_sibling = try Node.initInternal(self.allocator, left.height, self.cx);
                         for (all_children.slice()[midpoint..]) |child| {
-                            split_sibling.children.append(child);
+                            split_sibling.children.internal.append(child);
                         }
-                        split_sibling.summarize();
+                        split_sibling.summarize(self.cx);
 
                         right.deref(self.allocator);
-                        return split_sibling;
+                        return .{ .left = mut_left, .right = split_sibling };
                     }
                 }
             } else if (left.height > right.height) {
-                try self.makeMut(left_ptr);
-                left = left_ptr.*;
+                const mut_left = try self.toMut(left);
+                const last_idx = mut_left.children.internal.len - 1;
+                const last_child = mut_left.children.internal.data[last_idx];
 
-                const last_idx = left.children.len - 1;
-                var last_child = left.children.data[last_idx];
-                const split_child = try self.joinNodes(&last_child, &right);
-                left.children.data[last_idx] = last_child;
+                const res = try self.joinNodes(last_child, right);
+                mut_left.children.internal.data[last_idx] = res.left;
 
-                if (split_child) |sc| {
-                    if (left.children.len < MAX_CHILDREN) {
-                        left.children.append(sc);
-                        left.summarize();
-                        return null;
+                if (res.right) |rn| {
+                    if (mut_left.children.internal.len < MAX_CHILDREN) {
+                        mut_left.children.internal.append(rn);
+                        mut_left.summarize(self.cx);
+                        return .{ .left = mut_left, .right = null };
                     } else {
                         var all_children = BoundedArray(*Node, MAX_CHILDREN + 1).empty();
-                        for (left.children.slice()) |child| {
+                        for (mut_left.children.internal.slice()) |child| {
                             all_children.append(child.ref());
                         }
-                        all_children.append(sc);
+                        all_children.append(rn);
 
                         const midpoint = all_children.len / 2;
-
-                        for (left.children.slice()) |child| {
+                        for (mut_left.children.internal.slice()) |child| {
                             child.deref(self.allocator);
                         }
-                        left.children.len = 0;
+                        mut_left.children.internal.len = 0;
                         for (all_children.slice()[0..midpoint]) |child| {
-                            left.children.append(child);
+                            mut_left.children.internal.append(child);
                         }
-                        left.summarize();
+                        mut_left.summarize(self.cx);
 
-                        const split_sibling = try Node.initInternal(self.allocator, left.height);
+                        const split_sibling = try Node.initInternal(self.allocator, mut_left.height, self.cx);
                         for (all_children.slice()[midpoint..]) |child| {
-                            split_sibling.children.append(child);
+                            split_sibling.children.internal.append(child);
                         }
-                        split_sibling.summarize();
+                        split_sibling.summarize(self.cx);
 
-                        return split_sibling;
+                        return .{ .left = mut_left, .right = split_sibling };
                     }
                 } else {
-                    left.summarize();
-                    return null;
+                    mut_left.summarize(self.cx);
+                    return .{ .left = mut_left, .right = null };
                 }
             } else {
-                try self.makeMut(right_ptr);
-                right = right_ptr.*;
+                const mut_right = try self.toMut(right);
+                const first_child = mut_right.children.internal.data[0];
 
-                var first_child = right.children.data[0];
-                const split_child = try self.joinNodes(&left, &first_child);
-                right.children.data[0] = first_child;
+                const res = try self.joinNodes(left, first_child);
+                mut_right.children.internal.data[0] = res.left;
 
-                if (split_child) |sc| {
-                    if (right.children.len < MAX_CHILDREN) {
-                        var idx = right.children.len;
-                        while (idx > 0) : (idx -= 1) {
-                            right.children.data[idx] = right.children.data[idx - 1];
+                if (res.right) |rn| {
+                    if (mut_right.children.internal.len < MAX_CHILDREN) {
+                        var idx = mut_right.children.internal.len;
+                        while (idx > 1) : (idx -= 1) {
+                            mut_right.children.internal.data[idx] = mut_right.children.internal.data[idx - 1];
                         }
-                        right.children.data[0] = sc;
-                        right.children.len += 1;
-                        right.summarize();
-                        return null;
+                        mut_right.children.internal.data[1] = rn;
+                        mut_right.children.internal.len += 1;
+                        mut_right.summarize(self.cx);
+                        return .{ .left = mut_right, .right = null };
                     } else {
                         var all_children = BoundedArray(*Node, MAX_CHILDREN + 1).empty();
-                        all_children.append(sc);
-                        for (right.children.slice()) |child| {
+                        all_children.append(res.left.ref());
+                        all_children.append(rn);
+                        for (mut_right.children.internal.slice()[1..]) |child| {
                             all_children.append(child.ref());
                         }
 
                         const midpoint = all_children.len / 2;
-
-                        var left_half = BoundedArray(*Node, MAX_CHILDREN).empty();
-                        var right_half = BoundedArray(*Node, MAX_CHILDREN).empty();
-                        for (all_children.slice()[0..midpoint]) |child| {
-                            left_half.append(child);
-                        }
-                        for (all_children.slice()[midpoint..]) |child| {
-                            right_half.append(child);
-                        }
-
-                        for (right.children.slice()) |child| {
+                        for (mut_right.children.internal.slice()) |child| {
                             child.deref(self.allocator);
                         }
-
-                        right.children.len = 0;
-                        for (left_half.slice()) |child| {
-                            right.children.append(child);
+                        mut_right.children.internal.len = 0;
+                        for (all_children.slice()[0..midpoint]) |child| {
+                            mut_right.children.internal.append(child);
                         }
-                        right.summarize();
+                        mut_right.summarize(self.cx);
 
-                        const split_sibling = try Node.initInternal(self.allocator, right.height);
-                        for (right_half.slice()) |child| {
-                            split_sibling.children.append(child);
+                        const split_sibling = try Node.initInternal(self.allocator, mut_right.height, self.cx);
+                        for (all_children.slice()[midpoint..]) |child| {
+                            split_sibling.children.internal.append(child);
                         }
-                        split_sibling.summarize();
+                        split_sibling.summarize(self.cx);
 
-                        return split_sibling;
+                        return .{ .left = mut_right, .right = split_sibling };
                     }
                 } else {
-                    right.summarize();
-                    return null;
+                    mut_right.summarize(self.cx);
+                    return .{ .left = mut_right, .right = null };
                 }
             }
         }
 
         pub fn append(self: *Self, other: *Self) !void {
-            var r = other.root.ref();
-            const split_node = try self.joinNodes(&self.root, &r);
-            if (split_node) |sn| {
-                const new_root = try Node.initInternal(self.allocator, self.root.height + 1);
-                new_root.children.append(self.root);
-                new_root.children.append(sn);
-                new_root.summarize();
-                self.root = new_root;
+            if (self.isEmpty()) {
+                const old = self.root;
+                self.root = other.root.ref();
+                old.deref(self.allocator);
+                return;
             }
+            if (other.isEmpty()) {
+                return;
+            }
+
+            const was_in = self.in_transaction;
+            if (!was_in) {
+                self.in_transaction = true;
+                try self.startTransaction();
+            }
+            defer if (!was_in) {
+                self.in_transaction = false;
+                if (self.enable_history) self.saveHistory() catch {};
+            };
+
+            const res = try self.joinNodes(self.root.ref(), other.root.ref());
+            const old = self.root;
+            if (res.right) |rn| {
+                const new_root = try Node.initInternal(self.allocator, res.left.height + 1, self.cx);
+                new_root.children.internal.append(res.left);
+                new_root.children.internal.append(rn);
+                new_root.summarize(self.cx);
+                self.root = new_root;
+            } else {
+                self.root = res.left;
+            }
+            old.deref(self.allocator);
+            self.root = try self.collapseNode(self.root);
         }
 
         pub fn appendNode(self: *Self, other: **Node) !void {
-            const split_node = try self.joinNodes(&self.root, other);
-            if (split_node) |sn| {
-                const new_root = try Node.initInternal(self.allocator, self.root.height + 1);
-                new_root.children.append(self.root);
-                new_root.children.append(sn);
-                new_root.summarize();
-                self.root = new_root;
+            const other_is_empty = other.*.isLeaf() and other.*.children.leaf.len == 0;
+            if (self.isEmpty()) {
+                const old = self.root;
+                self.root = other.*;
+                old.deref(self.allocator);
+                return;
             }
+            if (other_is_empty) {
+                other.*.deref(self.allocator);
+                return;
+            }
+
+            const was_in = self.in_transaction;
+            if (!was_in) {
+                self.in_transaction = true;
+                try self.startTransaction();
+            }
+            defer if (!was_in) {
+                self.in_transaction = false;
+                if (self.enable_history) self.saveHistory() catch {};
+            };
+
+            const res = try self.joinNodes(self.root.ref(), other.*);
+            const old = self.root;
+            if (res.right) |rn| {
+                const new_root = try Node.initInternal(self.allocator, res.left.height + 1, self.cx);
+                new_root.children.internal.append(res.left);
+                new_root.children.internal.append(rn);
+                new_root.summarize(self.cx);
+                self.root = new_root;
+            } else {
+                self.root = res.left;
+            }
+            old.deref(self.allocator);
+            self.root = try self.collapseNode(self.root);
         }
 
-        pub fn push(self: *Self, text: []const u8) !void {
-            if (text.len == 0) return;
-            const start_idx = self.chunks.items.len;
-            try self.chunks.appendSlice(self.allocator, text);
+        pub fn push(self: *Self, item: Item) !void {
+            const was_in = self.in_transaction;
+            if (!was_in) {
+                self.in_transaction = true;
+                try self.startTransaction();
+            }
+            defer if (!was_in) {
+                self.in_transaction = false;
+                if (self.enable_history) self.saveHistory() catch {};
+            };
 
-            const new_leaf = try Node.initLeaf(self.allocator);
-            new_leaf.start = start_idx;
-            new_leaf.summary.dimensions[0] = text.len;
+            const new_leaf = try Node.initLeaf(self.allocator, self.cx);
+            new_leaf.children.leaf.append(item);
+            new_leaf.summarize(self.cx);
 
             var nl = new_leaf;
             try self.appendNode(&nl);
         }
 
-        pub fn replace(self: *Self, start: usize, len: usize, text: []const u8) !void {
-            var cursor = Cursor.init(self);
-            const prefix = try cursor.slice(start);
-            defer prefix.deinit();
+        pub fn Cursor(comptime Dimension: type) type {
+            return struct {
+                const CSelf = @This();
 
-            cursor.seekTo(start + len);
-            const suffix = try cursor.suffix();
-            defer suffix.deinit();
+                tree: *SumTree(Item),
+                stack: BoundedArray(StackEntry, 32) = .{},
+                position: Dimension,
+                cx: Summary.Context,
+                sought_val: ?usize = null,
 
-            const old_root = self.root;
-            self.root = try Node.initLeaf(self.allocator);
-            old_root.deref(self.allocator);
-
-            try self.append(prefix);
-            try self.push(text);
-            try self.append(suffix);
-        }
-
-        pub const Cursor = struct {
-            tree: *SumTree(ValueT),
-            stack: BoundedArray(StackEntry, 16) = .{},
-            offset: usize = 0,
-
-            pub const StackEntry = struct {
-                node: *Node,
-                index: usize,
-                offset: usize,
-            };
-
-            pub fn init(tree: *SumTree(ValueT)) Cursor {
-                var c = Cursor{
-                    .tree = tree,
+                const StackEntry = struct {
+                    node: *Node,
+                    index: usize,
+                    offset: Dimension,
                 };
-                c.reset();
-                return c;
-            }
 
-            pub fn reset(self: *Cursor) void {
-                self.stack.len = 0;
-                self.offset = 0;
-                if (self.tree.root.summary.dimensions[0] > 0) {
-                    self.stack.append(.{
-                        .node = self.tree.root,
-                        .index = 0,
-                        .offset = 0,
-                    });
-                    self.descendToLeaf();
+                pub fn init(tree: *SumTree(Item)) CSelf {
+                    var c = CSelf{
+                        .tree = tree,
+                        .position = Dimension.zero(tree.cx),
+                        .cx = tree.cx,
+                    };
+                    c.reset();
+                    return c;
                 }
-            }
 
-            fn descendToLeaf(self: *Cursor) void {
-                while (true) {
-                    const top = &self.stack.data[self.stack.len - 1];
-                    if (top.node.isLeaf()) break;
-                    const child = top.node.children.data[top.index];
-                    self.stack.append(.{
-                        .node = child,
-                        .index = 0,
-                        .offset = self.offset,
-                    });
-                }
-            }
-
-            pub fn seekTo(self: *Cursor, target: usize) void {
-                self.reset();
-                if (self.stack.len == 0) return;
-
-                self.stack.len = 0;
-                self.offset = 0;
-
-                var curr = self.tree.root;
-                while (true) {
-                    if (curr.isLeaf()) {
-                        const top = StackEntry{
-                            .node = curr,
+                pub fn reset(self: *CSelf) void {
+                    self.stack.len = 0;
+                    self.position = Dimension.zero(self.cx);
+                    self.sought_val = null;
+                    if (!self.tree.isEmpty()) {
+                        self.stack.append(.{
+                            .node = self.tree.root,
                             .index = 0,
-                            .offset = self.offset,
-                        };
-                        self.stack.append(top);
-                        const remaining = target - self.offset;
-                        const leaf_size = curr.summary.dimensions[0];
-                        if (remaining >= leaf_size) {
-                            self.offset += leaf_size;
-                        } else {
-                            self.offset = target;
-                        }
-                        break;
-                    } else {
-                        var child_offset = self.offset;
-                        var found_child = false;
-                        for (curr.children.slice(), 0..) |child, idx| {
-                            const child_size = child.summary.dimensions[0];
-                            if (target < child_offset + child_size) {
-                                self.stack.append(.{
-                                    .node = curr,
-                                    .index = idx,
-                                    .offset = self.offset,
-                                });
-                                self.offset = child_offset;
-                                curr = child;
-                                found_child = true;
-                                break;
-                            }
-                            child_offset += child_size;
-                        }
-                        if (!found_child) {
-                            const last_idx = curr.children.len - 1;
-                            const last_child = curr.children.data[last_idx];
+                            .offset = Dimension.zero(self.cx),
+                        });
+                        self.descendToLeaf();
+                    }
+                }
+
+                fn descendToLeaf(self: *CSelf) void {
+                    while (true) {
+                        const top = &self.stack.data[self.stack.len - 1];
+                        if (top.node.isLeaf()) break;
+                        const child = top.node.children.internal.data[top.index];
+                        self.stack.append(.{
+                            .node = child,
+                            .index = 0,
+                            .offset = self.position,
+                        });
+                    }
+                }
+
+                pub fn item(self: *const CSelf) ?Item {
+                    if (self.stack.len == 0) return null;
+                    const top = &self.stack.data[self.stack.len - 1];
+                    if (top.index >= top.node.children.leaf.len) return null;
+                    return top.node.children.leaf.data[top.index];
+                }
+
+                pub fn next(self: *CSelf) void {
+                    if (self.stack.len == 0) {
+                        if (!self.tree.isEmpty()) {
                             self.stack.append(.{
-                                .node = curr,
-                                .index = last_idx,
-                                .offset = self.offset,
+                                .node = self.tree.root,
+                                .index = 0,
+                                .offset = Dimension.zero(self.cx),
                             });
-                            self.offset = child_offset - last_child.summary.dimensions[0];
-                            curr = last_child;
+                            self.descendToLeaf();
+                            self.position = Dimension.zero(self.cx);
+                        }
+                        return;
+                    }
+
+                    var top = &self.stack.data[self.stack.len - 1];
+                    const current_item = top.node.children.leaf.data[top.index];
+                    self.position.addSummary(current_item.summary(self.cx), self.cx);
+                    top.index += 1;
+
+                    if (top.index < top.node.children.leaf.len) {
+                        return;
+                    }
+
+                    while (self.stack.len > 0) {
+                        self.stack.len -= 1;
+                        if (self.stack.len == 0) {
+                            self.position = Dimension.zero(self.cx);
+                            self.position.addSummary(self.tree.root.summary, self.cx);
+                            return;
+                        }
+                        var parent_top = &self.stack.data[self.stack.len - 1];
+                        parent_top.index += 1;
+                        if (parent_top.index < parent_top.node.children.internal.len) {
+                            self.descendToLeaf();
+                            return;
                         }
                     }
                 }
-            }
 
-            pub fn slice(self: *Cursor, length: usize) !*SumTree(ValueT) {
-                const slice_tree = try SumTree(ValueT).init(self.tree.allocator);
-                errdefer slice_tree.deinit();
+                pub fn prev(self: *CSelf) void {
+                    if (self.stack.len == 0) return;
 
-                slice_tree.chunks.deinit(slice_tree.allocator);
-                slice_tree.allocator.destroy(slice_tree.chunks);
-                slice_tree.chunks = self.tree.chunks;
-                slice_tree.managed_chunks = false;
+                    var top = &self.stack.data[self.stack.len - 1];
+                    if (top.index > 0) {
+                        top.index -= 1;
+                        self.recomputePosition();
+                        return;
+                    }
 
-                if (length == 0 or self.stack.len == 0) {
+                    while (self.stack.len > 0) {
+                        self.stack.len -= 1;
+                        if (self.stack.len == 0) {
+                            self.position = Dimension.zero(self.cx);
+                            return;
+                        }
+                        var parent_top = &self.stack.data[self.stack.len - 1];
+                        if (parent_top.index > 0) {
+                            parent_top.index -= 1;
+                            self.descendToRightmostLeaf();
+                            return;
+                        }
+                    }
+                }
+
+                pub fn descendToRightmostLeaf(self: *CSelf) void {
+                    while (true) {
+                        const top = &self.stack.data[self.stack.len - 1];
+                        if (top.node.isLeaf()) {
+                            top.index = top.node.children.leaf.len - 1;
+                            self.recomputePosition();
+                            break;
+                        }
+                        const child = top.node.children.internal.data[top.index];
+                        self.stack.append(.{
+                            .node = child,
+                            .index = child.children.internal.len - 1,
+                            .offset = Dimension.zero(self.cx),
+                        });
+                    }
+                }
+
+                fn recomputePosition(self: *CSelf) void {
+                    self.position = Dimension.zero(self.cx);
+                    for (self.stack.sliceMut()) |*entry| {
+                        entry.offset = self.position;
+                        switch (entry.node.children) {
+                            .internal => |internal| {
+                                for (internal.slice()[0..entry.index]) |child| {
+                                    self.position.addSummary(child.summary, self.cx);
+                                }
+                            },
+                            .leaf => |leaf| {
+                                for (leaf.slice()[0..entry.index]) |it| {
+                                    self.position.addSummary(it.summary(self.cx), self.cx);
+                                }
+                            },
+                        }
+                    }
+                }
+
+                pub fn getPosition(self: *const CSelf, comptime Dim: type) Dim {
+                    if (Dim == Dimension and self.sought_val != null) {
+                        return Dim{ .val = self.sought_val.? };
+                    }
+                    var pos = Dim.zero(self.cx);
+                    for (self.stack.slice()) |entry| {
+                        switch (entry.node.children) {
+                            .internal => |internal| {
+                                for (internal.slice()[0..entry.index]) |child| {
+                                    pos.addSummary(child.summary, self.cx);
+                                }
+                            },
+                            .leaf => |leaf| {
+                                for (leaf.slice()[0..entry.index]) |it| {
+                                    pos.addSummary(it.summary(self.cx), self.cx);
+                                }
+                            },
+                        }
+                    }
+                    return pos;
+                }
+
+                pub fn seekTo(self: *CSelf, target: anytype, bias: Bias) void {
+                    self.reset();
+                    if (self.stack.len == 0) return;
+
+                    self.stack.len = 0;
+                    self.position = Dimension.zero(self.cx);
+
+                    var curr = self.tree.root;
+                    while (true) {
+                        if (curr.isLeaf()) {
+                            self.stack.append(.{
+                                .node = curr,
+                                .index = 0,
+                                .offset = self.position,
+                            });
+                            const top = &self.stack.data[self.stack.len - 1];
+                            for (curr.children.leaf.slice(), 0..) |item_val, idx| {
+                                var item_end = self.position;
+                                item_end.addSummary(item_val.summary(self.cx), self.cx);
+                                const order = target.cmp(item_end, self.cx);
+                                if (order == .lt or (order == .eq and bias == .left)) {
+                                    top.index = idx;
+                                    break;
+                                }
+                                self.position = item_end;
+                                top.index = idx + 1;
+                            }
+                            break;
+                        } else {
+                            var found_child = false;
+                            for (curr.children.internal.slice(), 0..) |child, idx| {
+                                var child_end = self.position;
+                                child_end.addSummary(child.summary, self.cx);
+                                const order = target.cmp(child_end, self.cx);
+                                if (order == .lt or (order == .eq and bias == .left)) {
+                                    self.stack.append(.{
+                                        .node = curr,
+                                        .index = idx,
+                                        .offset = self.position,
+                                    });
+                                    curr = child;
+                                    found_child = true;
+                                    break;
+                                }
+                                self.position = child_end;
+                            }
+                            if (!found_child) {
+                                const last_idx = curr.children.internal.len - 1;
+                                self.stack.append(.{
+                                    .node = curr,
+                                    .index = last_idx,
+                                    .offset = self.position,
+                                });
+                                curr = curr.children.internal.data[last_idx];
+                                self.recomputePosition();
+                            }
+                        }
+                    }
+                    if (@hasField(@TypeOf(target), "target") and @hasField(Dimension, "val")) {
+                        self.sought_val = @intCast(target.target);
+                    }
+                }
+
+                pub fn slice(self: *CSelf, target: anytype, bias: Bias) !*SumTree(Item) {
+                    const pos_A = self.position;
+
+                    var pos_A_dim = Dimension.zero(self.cx);
+                    const target_A = DimensionSeekTarget(Dimension){ .target = pos_A };
+                    const split_A = try self.tree.splitNode(Dimension, self.tree.root, target_A, .right, &pos_A_dim);
+                    errdefer split_A.left.deref(self.tree.allocator);
+                    defer split_A.right.deref(self.tree.allocator);
+
+                    const split_B = try self.tree.splitNode(Dimension, split_A.right, target, bias, &pos_A_dim);
+                    errdefer split_B.left.deref(self.tree.allocator);
+                    defer split_B.right.deref(self.tree.allocator);
+
+                    const slice_tree = try SumTree(Item).init(self.tree.allocator, self.cx);
+                    slice_tree.root.deref(self.tree.allocator);
+                    slice_tree.root = split_B.left;
+
+                    split_A.left.deref(self.tree.allocator);
+
+                    self.seekTo(target, bias);
                     return slice_tree;
                 }
 
-                var remaining = length;
-                while (remaining > 0 and self.stack.len > 0) {
-                    const leaf_entry = &self.stack.data[self.stack.len - 1];
-                    const leaf_node = leaf_entry.node;
-                    const leaf_size = leaf_node.summary.dimensions[0];
-                    const leaf_offset = self.offset - leaf_entry.offset;
-                    const available = leaf_size - leaf_offset;
-
-                    if (remaining <= available) {
-                        const slice_leaf = try Node.initLeaf(self.tree.allocator);
-                        slice_leaf.start = leaf_node.start + leaf_offset;
-                        slice_leaf.summary.dimensions[0] = remaining;
-
-                        var sl = slice_leaf;
-                        try slice_tree.appendNode(&sl);
-                        self.offset += remaining;
-                        remaining = 0;
-                        break;
-                    } else {
-                        const slice_leaf = try Node.initLeaf(self.tree.allocator);
-                        slice_leaf.start = leaf_node.start + leaf_offset;
-                        slice_leaf.summary.dimensions[0] = available;
-
-                        var sl = slice_leaf;
-                        try slice_tree.appendNode(&sl);
-                        self.offset += available;
-                        remaining -= available;
-
-                        self.stack.len -= 1;
-                        var descended = false;
-                        while (self.stack.len > 0) {
-                            var top = &self.stack.data[self.stack.len - 1];
-                            if (top.index + 1 < top.node.children.len) {
-                                top.index += 1;
-                                const sibling = top.node.children.data[top.index];
-                                const sibling_size = sibling.summary.dimensions[0];
-
-                                if (remaining >= sibling_size) {
-                                    var sib = sibling.ref();
-                                    try slice_tree.appendNode(&sib);
-                                    self.offset += sibling_size;
-                                    remaining -= sibling_size;
-                                } else {
-                                    self.stack.append(.{
-                                        .node = sibling,
-                                        .index = 0,
-                                        .offset = self.offset,
-                                    });
-                                    while (true) {
-                                        const new_top = &self.stack.data[self.stack.len - 1];
-                                        if (new_top.node.isLeaf()) break;
-                                        const child = new_top.node.children.data[0];
-                                        self.stack.append(.{
-                                            .node = child,
-                                            .index = 0,
-                                            .offset = self.offset,
-                                        });
-                                    }
-                                    descended = true;
-                                    break;
-                                }
-                            } else {
-                                self.stack.len -= 1;
-                            }
-                        }
-                        if (!descended and remaining > 0) {
-                            break;
-                        }
-                    }
+                pub fn suffix(self: *CSelf) !*SumTree(Item) {
+                    const end_target = EndSeekTarget{};
+                    return self.slice(end_target, .right);
                 }
-
-                return slice_tree;
-            }
-
-            pub fn suffix(self: *Cursor) !*SumTree(ValueT) {
-                const total_size = self.tree.root.summary.dimensions[0];
-                const remaining = if (total_size > self.offset) total_size - self.offset else 0;
-                return self.slice(remaining);
-            }
-        };
+            };
+        }
     };
 }
+
+pub fn DimensionSeekTarget(comptime Dim: type) type {
+    return struct {
+        target: Dim,
+        pub fn cmp(self: @This(), pos: Dim, cx: anytype) std.math.Order {
+            _ = cx;
+            if (@hasField(Dim, "val")) {
+                return std.math.order(self.target.val, pos.val);
+            }
+            if (@hasField(Dim, "max_key")) {
+                if (pos.max_key) |pk| {
+                    if (self.target.max_key) |tk| {
+                        const K = @TypeOf(pk);
+                        const compareKeys = @import("TreeMap.zig").compareKeys;
+                        return compareKeys(K, tk, pk);
+                    }
+                    return .lt;
+                }
+                return .gt;
+            }
+            @compileError("Unsupported Dimension type for split seek target");
+        }
+    };
+}
+
+const EndSeekTarget = struct {
+    pub fn cmp(self: EndSeekTarget, cursor_pos: anytype, cx: anytype) std.math.Order {
+        _ = self;
+        _ = cursor_pos;
+        _ = cx;
+        return .gt;
+    }
+};
