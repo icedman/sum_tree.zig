@@ -341,3 +341,130 @@ gantt
 6. **Implement `TreeMap`:** Write `src/TreeMap.zig` wrapping `SumTree(MapEntry(K, V))`.
 7. **Implement `TreeSet`:** Write `src/TreeSet.zig` wrapping `TreeMap(K, void)`.
 8. **Fix Tests:** Update the existing tests in `src/tests.zig` to use the new generic structures, and add dedicated tests for both `TreeMap` and `TreeSet`.
+
+---
+
+## 7. Extending to a WrapMap (Zed-Inspired Display Mapping)
+
+### 7.1. Can `TreeMap` be the Basis of a `WrapMap`?
+
+In Zed's editor architecture, the raw buffer (`MultiBuffer`) is mapped to a display space via a sequence of translation maps called the **DisplayMap Pipeline**. The stages include:
+- `AnchorMap` -> `FoldMap` (folds regions of code) -> `TabMap` (expands tab characters to spaces) -> `WrapMap` (soft wraps long lines to fit the window width).
+
+To implement a similar `WrapMap` in our Zig library:
+- **A standard `TreeMap` is NOT the optimal basis:** A `TreeMap<K, V>` maps static, sorted keys to values. Because soft wrapping introduces virtual display rows, editing text on line 5 shifts the screen coordinates (display rows) of all subsequent lines. Updating absolute keys in a `TreeMap` would require $O(N)$ key shifts.
+- **`SumTree` is the ideal container:** Like Zed's implementation, a `SumTree(Item)` is perfect for a `WrapMap` because it aggregates *relative summaries* (e.g., display rows, buffer characters). Inserting, deleting, or re-wrapping a single line only requires updating a single leaf, taking $O(\log N)$ time, and the prefix sums (absolute coordinate offsets) are automatically accumulated by the tree hierarchy.
+
+---
+
+### 7.2. TUI-Specific WrapMap Design
+
+Unlike graphical editors (like GPUI/Zed) which require asynchronous pixel-width text measurements, a **TUI (Terminal User Interface)** environment uses monospace characters. This allows us to make the `WrapMap` completely synchronous, fast, and deterministic.
+
+#### 1. The `LineWrapEntry` Item
+We can store the wrapping details of each buffer line as an item in `SumTree(LineWrapEntry)`:
+
+```zig
+pub const LineWrapEntry = struct {
+    raw_chars: usize,  // Count of raw buffer characters in this line (including '\n')
+    display_rows: usize, // Number of screen rows this line takes at the current wrap width
+
+    pub const Summary = struct {
+        pub const Context = void;
+        buffer_lines: usize = 0,
+        raw_chars: usize = 0,
+        display_rows: usize = 0,
+
+        pub fn zero(cx: Context) Summary {
+            _ = cx;
+            return .{};
+        }
+
+        pub fn add(self: *Summary, other: Summary, cx: Context) void {
+            _ = cx;
+            self.buffer_lines += other.buffer_lines;
+            self.raw_chars += other.raw_chars;
+            self.display_rows += other.display_rows;
+        }
+    };
+
+    pub fn summary(self: LineWrapEntry, cx: Summary.Context) Summary {
+        _ = cx;
+        return .{
+            .buffer_lines = 1,
+            .raw_chars = self.raw_chars,
+            .display_rows = self.display_rows,
+        };
+    }
+};
+```
+
+#### 2. Coordinate Types
+```zig
+pub const BufferPoint = struct {
+    row: usize, // 0-indexed buffer line
+    col: usize, // 0-indexed byte/char offset within line
+};
+
+pub const DisplayPoint = struct {
+    row: usize, // 0-indexed terminal screen line
+    col: usize, // 0-indexed screen column
+};
+```
+
+---
+
+### 7.3. Coordinate Translation Flow
+
+By using a `Cursor` on `SumTree(LineWrapEntry)`, we can translate coordinates in $O(\log N)$ time:
+
+#### 1. `bufferToDisplay(self: *WrapMap, pt: BufferPoint) DisplayPoint`
+1. Seek the cursor to the seek target `pt.row` using `buffer_lines` as the seek dimension.
+2. The cursor's accumulated display rows tell us the screen row where the buffer line starts.
+3. Within the target line, calculate how many screen rows are spanned by `pt.col` using the wrap width $W$:
+   - `line_row_offset = pt.col / W`
+   - `line_col_offset = pt.col % W`
+4. Return `DisplayPoint{ .row = accumulated_display_rows + line_row_offset, .col = line_col_offset }`.
+
+#### 2. `displayToBuffer(self: *WrapMap, pt: DisplayPoint) BufferPoint`
+1. Seek the cursor to `pt.row` using `display_rows` as the seek dimension.
+2. The cursor's accumulated `buffer_lines` gives us the raw buffer row `pt.row`.
+3. Within that line, the vertical offset on screen is `line_row_offset = pt.row - accumulated_display_rows`.
+4. Calculate the character column: `char_col = line_row_offset * W + pt.col`.
+5. Return `BufferPoint{ .row = accumulated_buffer_lines, .col = @min(char_col, raw_line_len) }`.
+
+---
+
+### 7.4. Implementation & Integration Plan in `examples/editor.zig`
+
+To integrate this TUI-aware soft wrapping into our editor, we will follow these steps:
+
+```mermaid
+graph LR
+    Rope["Raw Text Rope"] --> WrapMap["WrapMap (SumTree)"]
+    WrapMap --> RenderLoop["TUI Renderer (Wraps Line by Line)"]
+    EditorCursor["User Cursor (Display coordinates)"] --> WrapMap
+```
+
+#### Step 1: WrapMap Module
+Create `src/WrapMap.zig` wrapping `SumTree(LineWrapEntry)`:
+- Initialize the tree by reading lines from the `Rope` and computing their `display_rows` based on the wrap width $W$.
+- Expose `bufferToDisplay` and `displayToBuffer` translation helpers.
+- Expose a `replace(line_idx: usize, old_count: usize, new_lines: []const LineWrapEntry)` method to incrementally update the wrap metrics in $O(\log N)$ when edits occur.
+
+#### Step 2: Update Rendering in `examples/editor.zig`
+Modify the draw loop inside [examples/editor.zig](file:///home/iceman/Developer/zig/sum_tree/examples/editor.zig):
+1. Instead of rendering raw lines from the rope, query `WrapMap` to find which raw characters span each visible screen row.
+2. Use `displayToBuffer` to translate the visible screen range `[top_scroll_row, top_scroll_row + height]` to the corresponding rope text ranges.
+3. Draw exactly $W$ characters per screen row, adding a visual indicator (like a soft-wrapped arrow `↵` or subtle styling) at the wrap point.
+
+#### Step 3: Handle Window Resizing
+When the terminal window size changes:
+1. Capture the new width $W$.
+2. Re-initialize/re-populate the `WrapMap` with the new width $W$. Since character wrapping is O(N), this takes < 1ms even for large documents.
+3. Re-render the editor viewport.
+
+#### Step 4: Adjust Navigation (Up / Down Keys)
+- Moving the cursor **Up / Down** must navigate line-by-line in **Display Space** (so pressing Down moves to the next wrapped screen line segment, not the next physical buffer line).
+- Translate the final display cursor coordinates back to `BufferPoint` offsets to perform edits on the underlying `Rope`.
+

@@ -67,6 +67,30 @@ pub fn main(init: std.process.Init) !void {
     // Persist render_cursor outside main loop
     var render_cursor = RenderCursor.init(rope.tree);
 
+    const init_size = try tui.getScreenSize();
+    var wrap_map = try sum_tree.WrapMap.init(allocator, init_size.width);
+    defer wrap_map.deinit();
+    try wrap_map.rewrapAll(init_size.width, rope);
+
+    const EditorContext = struct {
+        wrap_map: *sum_tree.WrapMap,
+        rope: *Rope,
+        render_cursor: *RenderCursor,
+        tui: *Tui,
+        
+        fn onEdit(self: @This()) !void {
+            const size = try self.tui.getScreenSize();
+            self.render_cursor.* = RenderCursor.init(self.rope.tree);
+            try self.wrap_map.rewrapAll(size.width, self.rope);
+        }
+    };
+    const ed_ctx = EditorContext{
+        .wrap_map = wrap_map,
+        .rope = rope,
+        .render_cursor = &render_cursor,
+        .tui = tui,
+    };
+
     // Helper to get line text reusing the persistent render_cursor
     const getLineText = struct {
         fn call(r: *Rope, rc: *RenderCursor, row: usize, buf: *std.ArrayList(u8)) !void {
@@ -112,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
             force_render = true;
             prev_screen_width = screen_width;
             prev_screen_height = screen_height;
+            try wrap_map.rewrapAll(screen_width, rope);
         }
 
         const total_newlines = rope.tree.root.summary.line_len;
@@ -120,22 +145,16 @@ pub fn main(init: std.process.Init) !void {
             force_render = false;
 
             // Viewport Scroll Constraints
+            const display_cursor = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
             if (screen_height >= 3) {
-                if (cursor_pos.row < viewport_offset.row) {
-                    viewport_offset.row = cursor_pos.row;
+                if (display_cursor.row < viewport_offset.row) {
+                    viewport_offset.row = display_cursor.row;
                 }
-                if (cursor_pos.row >= viewport_offset.row + screen_height - 2) {
-                    viewport_offset.row = cursor_pos.row - (screen_height - 3);
-                }
-            }
-            if (screen_width >= 1) {
-                if (cursor_pos.column < viewport_offset.column) {
-                    viewport_offset.column = cursor_pos.column;
-                }
-                if (cursor_pos.column >= viewport_offset.column + screen_width) {
-                    viewport_offset.column = cursor_pos.column - screen_width + 1;
+                if (display_cursor.row >= viewport_offset.row + screen_height - 2) {
+                    viewport_offset.row = display_cursor.row - (screen_height - 3);
                 }
             }
+            viewport_offset.column = 0;
 
             // Render Frame
             render_buf.clearRetainingCapacity();
@@ -144,9 +163,12 @@ pub fn main(init: std.process.Init) !void {
             var r: usize = 0;
             const render_limit = if (screen_height >= 2) screen_height - 2 else 0;
             while (r < render_limit) : (r += 1) {
-                const line_idx = viewport_offset.row + r;
-                if (line_idx <= total_newlines) {
-                    try rope.lineText(line_idx, &line_buf);
+                const display_row = viewport_offset.row + r;
+                const start_pt = wrap_map.displayToBuffer(.{ .row = display_row, .col = 0 });
+                const total_lines = rope.tree.root.summary.line_len + 1;
+
+                if (start_pt.row < total_lines) {
+                    try rope.lineText(start_pt.row, &line_buf);
 
                     // Strip trailing newlines
                     var text_len = line_buf.items.len;
@@ -155,10 +177,13 @@ pub fn main(init: std.process.Init) !void {
                     }
                     const clean_line = line_buf.items[0..text_len];
 
-                    if (clean_line.len > viewport_offset.column) {
-                        const start_col = viewport_offset.column;
-                        const visible_len = @min(clean_line.len - start_col, screen_width);
-                        try render_buf.appendSlice(allocator, clean_line[start_col .. start_col + visible_len]);
+                    const display_start_for_line = wrap_map.bufferToDisplay(.{ .row = start_pt.row, .column = 0 }).row;
+                    const sub_row = display_row - display_start_for_line;
+
+                    const char_start = sub_row * screen_width;
+                    if (char_start < clean_line.len) {
+                        const visible_len = @min(clean_line.len - char_start, screen_width);
+                        try render_buf.appendSlice(allocator, clean_line[char_start .. char_start + visible_len]);
                     }
                 }
                 try render_buf.appendSlice(allocator, "\x1b[K\r\n"); // Clear line and newline
@@ -184,9 +209,11 @@ pub fn main(init: std.process.Init) !void {
                     if (status_timer == 0) status_message = null;
                 }
             } else {
-                try status_content.print(allocator, " -- {s} -- [File: {s}] | Cursor: {}:{} | Total Lines: {} | ESC: Normal | i: Insert | Ctrl-S: Save", .{
+                try status_content.print(allocator, " -- {s} -- [File: {s}] | Cursor: {}:{} (Buf: {}:{}) | Total Lines: {} | ESC: Normal | i: Insert | Ctrl-S: Save", .{
                     mode_str,
                     filename,
+                    display_cursor.row + 1,
+                    display_cursor.col + 1,
                     cursor_pos.row + 1,
                     cursor_pos.column + 1,
                     total_newlines + 1,
@@ -212,8 +239,8 @@ pub fn main(init: std.process.Init) !void {
             if (current_mode == .command) {
                 try tui.positionCursor(&render_buf, screen_height, command_input.items.len + 2);
             } else {
-                const screen_row = cursor_pos.row - viewport_offset.row + 1;
-                const screen_col = cursor_pos.column - viewport_offset.column + 1;
+                const screen_row = display_cursor.row - viewport_offset.row + 1;
+                const screen_col = display_cursor.col + 1;
                 try tui.positionCursor(&render_buf, screen_row, screen_col);
             }
 
@@ -325,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
                     force_render = true;
                     continue;
                 };
-                render_cursor = RenderCursor.init(rope.tree);
+                try ed_ctx.onEdit();
                 cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
                 force_render = true;
             },
@@ -336,7 +363,7 @@ pub fn main(init: std.process.Init) !void {
                     force_render = true;
                     continue;
                 };
-                render_cursor = RenderCursor.init(rope.tree);
+                try ed_ctx.onEdit();
                 cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
                 force_render = true;
             },
@@ -348,7 +375,7 @@ pub fn main(init: std.process.Init) !void {
                         force_render = true;
                         continue;
                     };
-                    render_cursor = RenderCursor.init(rope.tree);
+                    try ed_ctx.onEdit();
                     cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
                     force_render = true;
                 }
@@ -364,70 +391,43 @@ pub fn main(init: std.process.Init) !void {
                 }
             },
             .up => {
-                if (cursor_pos.row > 0) {
-                    cursor_pos.row -= 1;
-                    try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                    var line_len = line_buf.items.len;
-                    while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                        line_len -= 1;
-                    }
-                    cursor_pos.column = @min(cursor_pos.column, line_len);
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                if (disp_pos.row > 0) {
+                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row - 1, .col = disp_pos.col });
                     force_render = true;
                 }
             },
             .down => {
-                if (cursor_pos.row < total_newlines) {
-                    cursor_pos.row += 1;
-                    try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                    var line_len = line_buf.items.len;
-                    while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                        line_len -= 1;
-                    }
-                    cursor_pos.column = @min(cursor_pos.column, line_len);
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                const total_display_rows = wrap_map.tree.root.summary.display_rows;
+                if (disp_pos.row + 1 < total_display_rows) {
+                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row + 1, .col = disp_pos.col });
                     force_render = true;
                 }
             },
             .home => {
-                cursor_pos.column = 0;
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = 0 });
                 force_render = true;
             },
             .end => {
-                try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                var line_len = line_buf.items.len;
-                while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                    line_len -= 1;
-                }
-                cursor_pos.column = line_len;
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = screen_width - 1 });
                 force_render = true;
             },
             .page_up => {
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
                 const page = screen_height - 2;
-                if (cursor_pos.row > page) {
-                    cursor_pos.row -= page;
-                } else {
-                    cursor_pos.row = 0;
-                }
-                try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                var line_len = line_buf.items.len;
-                while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                    line_len -= 1;
-                }
-                cursor_pos.column = @min(cursor_pos.column, line_len);
+                const target_row = if (disp_pos.row > page) disp_pos.row - page else 0;
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = target_row, .col = disp_pos.col });
                 force_render = true;
             },
             .page_down => {
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
                 const page = screen_height - 2;
-                if (cursor_pos.row + page < total_newlines) {
-                    cursor_pos.row += page;
-                } else {
-                    cursor_pos.row = total_newlines;
-                }
-                try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                var line_len = line_buf.items.len;
-                while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                    line_len -= 1;
-                }
-                cursor_pos.column = @min(cursor_pos.column, line_len);
+                const total_display_rows = wrap_map.tree.root.summary.display_rows;
+                const target_row = if (disp_pos.row + page < total_display_rows) disp_pos.row + page else (if (total_display_rows > 0) total_display_rows - 1 else 0);
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = target_row, .col = disp_pos.col });
                 force_render = true;
             },
             .right => {
@@ -466,7 +466,7 @@ pub fn main(init: std.process.Init) !void {
                     const total_char = rope.tree.root.summary.char_len;
                     if (offset < total_char) {
                         try rope.delete(offset, 1);
-                        render_cursor = RenderCursor.init(rope.tree);
+                        try ed_ctx.onEdit();
                         force_render = true;
                     }
                 }
@@ -476,7 +476,7 @@ pub fn main(init: std.process.Init) !void {
                     if (cursor_pos.row > 0 or cursor_pos.column > 0) {
                         const offset = rope.pointToOffset(cursor_pos);
                         try rope.delete(offset - 1, 1);
-                        render_cursor = RenderCursor.init(rope.tree);
+                        try ed_ctx.onEdit();
                         if (cursor_pos.column > 0) {
                             cursor_pos.column -= 1;
                         } else {
@@ -496,7 +496,7 @@ pub fn main(init: std.process.Init) !void {
                 if (current_mode == .insert) {
                     const offset = rope.pointToOffset(cursor_pos);
                     try rope.insert(offset, "\n");
-                    render_cursor = RenderCursor.init(rope.tree);
+                    try ed_ctx.onEdit();
                     cursor_pos.row += 1;
                     cursor_pos.column = 0;
                     force_render = true;
@@ -520,7 +520,7 @@ pub fn main(init: std.process.Init) !void {
 
                                 if (end_offset > start_offset) {
                                     try rope.delete(start_offset, end_offset - start_offset);
-                                    render_cursor = RenderCursor.init(rope.tree);
+                                    try ed_ctx.onEdit();
                                     // Recalculate line count after deletion
                                     const new_newlines = rope.tree.root.summary.line_len;
                                     if (cursor_pos.row > 0 and cursor_pos.row >= new_newlines) {
@@ -565,7 +565,7 @@ pub fn main(init: std.process.Init) !void {
                                     cursor_pos.column = line_len;
                                     const offset = rope.pointToOffset(cursor_pos);
                                     try rope.insert(offset, "\n");
-                                    render_cursor = RenderCursor.init(rope.tree);
+                                    try ed_ctx.onEdit();
                                     cursor_pos.row += 1;
                                     cursor_pos.column = 0;
                                     current_mode = .insert;
@@ -575,7 +575,7 @@ pub fn main(init: std.process.Init) !void {
                                     cursor_pos.column = 0;
                                     const offset = rope.pointToOffset(cursor_pos);
                                     try rope.insert(offset, "\n");
-                                    render_cursor = RenderCursor.init(rope.tree);
+                                    try ed_ctx.onEdit();
                                     cursor_pos.column = 0;
                                     current_mode = .insert;
                                     force_render = true;
@@ -587,26 +587,17 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 },
                                 'j' => {
-                                    if (cursor_pos.row < total_newlines) {
-                                        cursor_pos.row += 1;
-                                        try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                                        var line_len = line_buf.items.len;
-                                        while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                                            line_len -= 1;
-                                        }
-                                        cursor_pos.column = @min(cursor_pos.column, line_len);
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                                    const total_display_rows = wrap_map.tree.root.summary.display_rows;
+                                    if (disp_pos.row + 1 < total_display_rows) {
+                                        cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row + 1, .col = disp_pos.col });
                                         force_render = true;
                                     }
                                 },
                                 'k' => {
-                                    if (cursor_pos.row > 0) {
-                                        cursor_pos.row -= 1;
-                                        try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                                        var line_len = line_buf.items.len;
-                                        while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                                            line_len -= 1;
-                                        }
-                                        cursor_pos.column = @min(cursor_pos.column, line_len);
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                                    if (disp_pos.row > 0) {
+                                        cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row - 1, .col = disp_pos.col });
                                         force_render = true;
                                     }
                                 },
@@ -627,7 +618,7 @@ pub fn main(init: std.process.Init) !void {
                                     const total_char = rope.tree.root.summary.char_len;
                                     if (offset < total_char) {
                                         try rope.delete(offset, 1);
-                                        render_cursor = RenderCursor.init(rope.tree);
+                                        try ed_ctx.onEdit();
                                         try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
                                         var line_len = line_buf.items.len;
                                         while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
@@ -639,17 +630,13 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 },
                                 '0' => {
-                                    cursor_pos.column = 0;
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = 0 });
                                     force_render = true;
                                 },
                                 '$' => {
-                                    try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                                    var line_len = line_buf.items.len;
-                                    while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                                        line_len -= 1;
-                                    }
-                                    const max_col = if (line_len > 0) line_len - 1 else 0;
-                                    cursor_pos.column = max_col;
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = screen_width - 1 });
                                     force_render = true;
                                 },
                                 '^' => {
@@ -743,7 +730,7 @@ pub fn main(init: std.process.Init) !void {
                                         force_render = true;
                                         continue;
                                     };
-                                    render_cursor = RenderCursor.init(rope.tree);
+                                    try ed_ctx.onEdit();
                                     cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
                                     force_render = true;
                                 },
@@ -778,7 +765,7 @@ pub fn main(init: std.process.Init) !void {
                 } else {
                     const offset = rope.pointToOffset(cursor_pos);
                     try rope.insert(offset, seq);
-                    render_cursor = RenderCursor.init(rope.tree);
+                    try ed_ctx.onEdit();
                     cursor_pos.column += seq.len;
                     force_render = true;
                 }

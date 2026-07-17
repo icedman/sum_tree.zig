@@ -547,3 +547,49 @@ test "Rope comprehensive randomized fuzzing" {
         }
     }
 }
+
+test "WrapMap basic operations" {
+    const allocator = std.testing.allocator;
+    const WrapMap = root.WrapMap;
+
+    const rope = try Rope.init(allocator);
+    defer rope.deinit();
+
+    // Line 0: length 12 -> wrapped to width 5: display rows = 3 (hello, worl, d\n)
+    // Line 1: length 5 -> wrapped to width 5: display rows = 1 (test\n)
+    try rope.insert(0, "hello world\ntest\n");
+
+    var wrap_map = try WrapMap.init(allocator, 5);
+    defer wrap_map.deinit();
+
+    try wrap_map.rewrapAll(5, rope);
+
+    // Expecting 2 physical lines in rope:
+    // Line 0 is "hello world\n" (len 12)
+    // Line 1 is "test\n" (len 5)
+    // Line 2 is "" (len 0)
+    try std.testing.expectEqual(@as(usize, 3), wrap_map.calculateDisplayRows(11)); // "hello world" (len 11 visible)
+    try std.testing.expectEqual(@as(usize, 1), wrap_map.calculateDisplayRows(4));  // "test" (len 4 visible)
+
+    // Test bufferToDisplay translation
+    // Line 0, char 0 ("h") -> Display row 0, col 0
+    const dp0 = wrap_map.bufferToDisplay(.{ .row = 0, .column = 0 });
+    try std.testing.expectEqual(@as(usize, 0), dp0.row);
+    try std.testing.expectEqual(@as(usize, 0), dp0.col);
+
+    // Line 0, char 6 ("w") -> Display row 1, col 1 (since 'hello ' is 6 chars, 6 / 5 = 1 row offset, 6 % 5 = 1 col offset)
+    const dp1 = wrap_map.bufferToDisplay(.{ .row = 0, .column = 6 });
+    try std.testing.expectEqual(@as(usize, 1), dp1.row);
+    try std.testing.expectEqual(@as(usize, 1), dp1.col);
+
+    // Test displayToBuffer translation
+    // Display row 1, col 1 -> Line 0, char 6
+    const bp1 = wrap_map.displayToBuffer(.{ .row = 1, .col = 1 });
+    try std.testing.expectEqual(@as(usize, 0), bp1.row);
+    try std.testing.expectEqual(@as(usize, 6), bp1.column);
+
+    // Display row 3, col 2 -> Line 1, char 2 ("s")
+    const bp2 = wrap_map.displayToBuffer(.{ .row = 3, .col = 2 });
+    try std.testing.expectEqual(@as(usize, 1), bp2.row);
+    try std.testing.expectEqual(@as(usize, 2), bp2.column);
+}
