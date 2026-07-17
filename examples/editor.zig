@@ -133,6 +133,10 @@ pub fn main(init: std.process.Init) !void {
     var command_input = std.ArrayList(u8).empty;
     defer command_input.deinit(allocator);
 
+    var selection_manager = sum_tree.SelectionManager.init(allocator);
+    defer selection_manager.deinit();
+    var visual_anchor_pos = Point{ .row = 0, .column = 0 };
+
     // 4. Main Event Loop
     while (true) {
         // Query Terminal Size via Tui helper
@@ -151,6 +155,31 @@ pub fn main(init: std.process.Init) !void {
 
         if (force_render) {
             force_render = false;
+
+            // Sync selections
+            selection_manager.clear();
+            if (current_mode == .visual) {
+                const total_char = rope.tree.root.summary.char_len;
+                const head = rope.pointToOffset(cursor_pos);
+                const tail = rope.pointToOffset(visual_anchor_pos);
+                if (head >= tail) {
+                    try selection_manager.addSelection(@min(head + 1, total_char), tail);
+                } else {
+                    try selection_manager.addSelection(head, @min(tail + 1, total_char));
+                }
+            } else if (current_mode == .visual_line) {
+                const min_row = @min(cursor_pos.row, visual_anchor_pos.row);
+                const max_row = @max(cursor_pos.row, visual_anchor_pos.row);
+                const start_offset = rope.pointToOffset(Point{ .row = min_row, .column = 0 });
+                const end_offset = if (max_row >= total_newlines)
+                    rope.tree.root.summary.char_len
+                else
+                    rope.pointToOffset(Point{ .row = max_row + 1, .column = 0 });
+                try selection_manager.addSelection(start_offset, end_offset);
+            } else {
+                const offset = rope.pointToOffset(cursor_pos);
+                try selection_manager.addSelection(offset, offset);
+            }
 
             // Viewport Scroll Constraints
             const display_cursor = try wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
@@ -194,18 +223,46 @@ pub fn main(init: std.process.Init) !void {
                     }
                     const clean_line = line_buf.items[0..text_len];
 
-                    // Expand tabs to spaces
-                    var expanded_line = std.ArrayList(u8).empty;
-                    defer expanded_line.deinit(allocator);
-                    try sum_tree.expandTabs(allocator, clean_line, 4, &expanded_line);
-
                     const display_start_for_line = (try wrap_map.bufferToDisplay(.{ .row = start_pt.row, .column = 0 }, rope)).row;
                     const sub_row = display_row - display_start_for_line;
 
                     const char_start = sub_row * (if (wrap_enabled) screen_width else wrap_map.wrap_width) + (if (wrap_enabled) 0 else viewport_offset.column);
-                    if (char_start < expanded_line.items.len) {
-                        const visible_len = @min(expanded_line.items.len - char_start, screen_width);
-                        try render_buf.appendSlice(allocator, expanded_line.items[char_start .. char_start + visible_len]);
+
+                    // Offset of start of the line in the rope
+                    const line_start_offset = rope.pointToOffset(Point{ .row = start_pt.row, .column = 0 });
+
+                    var col: usize = 0;
+                    for (clean_line, 0..) |char, raw_idx| {
+                        const char_offset = line_start_offset + raw_idx;
+                        const is_selected = selection_manager.isOffsetSelected(char_offset);
+
+                        const spaces = if (char == '\t') 4 - (col % 4) else 1;
+                        var s: usize = 0;
+                        while (s < spaces) : (s += 1) {
+                            const exp_col = col + s;
+                            if (exp_col >= char_start and exp_col < char_start + screen_width) {
+                                if (is_selected) {
+                                    try render_buf.appendSlice(allocator, "\x1b[48;5;239m");
+                                }
+                                if (char == '\t') {
+                                    try render_buf.appendSlice(allocator, " ");
+                                } else {
+                                    try render_buf.append(allocator, char);
+                                }
+                                if (is_selected) {
+                                    try render_buf.appendSlice(allocator, "\x1b[m");
+                                }
+                            }
+                        }
+                        col += spaces;
+                    }
+
+                    // Highlight selected newline at end of line (rendered as a single highlighted space)
+                    const newline_offset = line_start_offset + clean_line.len;
+                    if (selection_manager.isOffsetSelected(newline_offset)) {
+                        if (col >= char_start and col < char_start + screen_width) {
+                            try render_buf.appendSlice(allocator, "\x1b[48;5;239m \x1b[m");
+                        }
                     }
                 }
                 try render_buf.appendSlice(allocator, "\x1b[K\r\n"); // Clear line and newline
@@ -795,10 +852,12 @@ pub fn main(init: std.process.Init) !void {
                                 },
                                 'v' => {
                                     current_mode = .visual;
+                                    visual_anchor_pos = cursor_pos;
                                     force_render = true;
                                 },
                                 'V' => {
                                     current_mode = .visual_line;
+                                    visual_anchor_pos = cursor_pos;
                                     force_render = true;
                                 },
                                 ':' => {

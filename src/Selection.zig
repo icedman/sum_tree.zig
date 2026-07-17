@@ -40,12 +40,12 @@ pub const SelectionManager = struct {
     pub fn init(allocator: std.mem.Allocator) SelectionManager {
         return .{
             .allocator = allocator,
-            .selections = std.ArrayList(Selection).init(allocator),
+            .selections = std.ArrayList(Selection).empty,
         };
     }
 
     pub fn deinit(self: *SelectionManager) void {
-        self.selections.deinit();
+        self.selections.deinit(self.allocator);
     }
 
     pub fn clear(self: *SelectionManager) void {
@@ -55,7 +55,7 @@ pub const SelectionManager = struct {
     pub fn addSelection(self: *SelectionManager, head: usize, tail: usize) !void {
         const id = self.next_id;
         self.next_id += 1;
-        try self.selections.append(Selection.init(id, head, tail));
+        try self.selections.append(self.allocator, Selection.init(id, head, tail));
         self.normalize();
     }
 
@@ -76,12 +76,12 @@ pub const SelectionManager = struct {
         // Sort by start offset
         std.sort.block(Selection, self.selections.items, {}, sortSelections);
 
-        var merged = std.ArrayList(Selection).init(self.allocator);
-        defer merged.deinit();
+        var merged = std.ArrayList(Selection).empty;
+        defer merged.deinit(self.allocator);
 
         for (self.selections.items) |sel| {
             if (merged.items.len == 0) {
-                merged.append(sel) catch {};
+                merged.append(self.allocator, sel) catch {};
                 continue;
             }
 
@@ -96,12 +96,12 @@ pub const SelectionManager = struct {
                 last.head = new_head;
                 last.tail = new_tail;
             } else {
-                merged.append(sel) catch {};
+                merged.append(self.allocator, sel) catch {};
             }
         }
 
         self.selections.clearRetainingCapacity();
-        self.selections.appendSlice(merged.items) catch {};
+        self.selections.appendSlice(self.allocator, merged.items) catch {};
     }
 
     fn sortSelections(context: void, a: Selection, b: Selection) bool {

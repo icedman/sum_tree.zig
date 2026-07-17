@@ -613,3 +613,26 @@ test "WrapMap basic operations" {
     try std.testing.expectEqual(@as(usize, 0), bp_tab.row);
     try std.testing.expectEqual(@as(usize, 1), bp_tab.column);
 }
+
+test "SelectionManager basic operations and normalization" {
+    const allocator = std.testing.allocator;
+    const SelectionManager = @import("Selection.zig").SelectionManager;
+
+    var sm = SelectionManager.init(allocator);
+    defer sm.deinit();
+
+    // 1. Add disjoint selections
+    try sm.addSelection(10, 5); // start=5, end=10 (reversed)
+    try sm.addSelection(15, 20); // start=15, end=20
+
+    try std.testing.expectEqual(@as(usize, 2), sm.selections.items.len);
+    try std.testing.expect(sm.isOffsetSelected(7));
+    try std.testing.expect(sm.isOffsetSelected(17));
+    try std.testing.expect(!sm.isOffsetSelected(12));
+
+    // 2. Add overlapping selection that merges
+    try sm.addSelection(8, 16); // overlaps both! [5, 10] and [15, 20] -> should merge into [5, 20]
+    try std.testing.expectEqual(@as(usize, 1), sm.selections.items.len);
+    try std.testing.expectEqual(@as(usize, 5), sm.selections.items[0].start());
+    try std.testing.expectEqual(@as(usize, 20), sm.selections.items[0].end());
+}
