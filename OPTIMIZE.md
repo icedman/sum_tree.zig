@@ -72,4 +72,27 @@ Modify `examples/editor.zig` to use `Rope.initFromString` when loading a file:
     } else {
         rope = try Rope.init(allocator);
     }
+    defer rope.deinit();
+```
+
+---
+
+## 4. Keystroke Editing Optimization Plan
+
+### 4.1. Current Keystroke Bottleneck
+Whenever a key is pressed (a character typed, backspace, or delete), `examples/editor.zig` calls `ed_ctx.onEdit()`. This completely clears and rebuilds the `WrapMap` tree from scratch by pushing estimates for all $N$ lines, which takes $\mathcal{O}(N)$ time.
+While this was acceptable for small files, for a 100,000-line file it introduces a 2ms–5ms lag on every keystroke, which is noticeable during fast typing.
+
+### 4.2. Incremental Line Wrapping Updates ($\mathcal{O}(\log N)$)
+Since typing a character or backspacing within a line only alters the text of the *current line*, the wrapping of all other lines remains identical.
+Instead of rebuilding the entire tree, we can update the modified line in-place in $\mathcal{O}(\log N)$ time:
+1. **`updateLine(row, rope)` method**:
+   - Fetches the current text for the modified line.
+   - Computes its precise wrapping layout.
+   - Replaces the line entry at index `row` in the `WrapMap` tree.
+   - Marks the line as wrapped in the dynamic bitset.
+2. **Editor Context Integration**:
+   - Add `onLineEdit(row)` to `EditorContext`.
+   - Use `onLineEdit(row)` for character input and single-line backspaces/deletes.
+   - Fall back to the full `onEdit()` only when line counts change (e.g. inserting a newline or deleting a newline to merge lines).
 ```
