@@ -85,6 +85,11 @@ pub fn main(init: std.process.Init) !void {
             const target_width = if (self.wrap_enabled.*) size.width else 100000;
             try self.wrap_map.rewrapAll(target_width, self.rope);
         }
+
+        fn onLineEdit(self: @This(), row: usize) !void {
+            self.render_cursor.* = RenderCursor.init(self.rope.tree);
+            try self.wrap_map.updateLine(row, self.rope);
+        }
     };
     const ed_ctx = EditorContext{
         .wrap_map = wrap_map,
@@ -498,8 +503,17 @@ pub fn main(init: std.process.Init) !void {
                     const offset = rope.pointToOffset(cursor_pos);
                     const total_char = rope.tree.root.summary.char_len;
                     if (offset < total_char) {
+                        try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
+                        var line_len = line_buf.items.len;
+                        while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
+                            line_len -= 1;
+                        }
                         try rope.delete(offset, 1);
-                        try ed_ctx.onEdit();
+                        if (cursor_pos.column < line_len) {
+                            try ed_ctx.onLineEdit(cursor_pos.row);
+                        } else {
+                            try ed_ctx.onEdit();
+                        }
                         force_render = true;
                     }
                 }
@@ -509,9 +523,9 @@ pub fn main(init: std.process.Init) !void {
                     if (cursor_pos.row > 0 or cursor_pos.column > 0) {
                         const offset = rope.pointToOffset(cursor_pos);
                         try rope.delete(offset - 1, 1);
-                        try ed_ctx.onEdit();
                         if (cursor_pos.column > 0) {
                             cursor_pos.column -= 1;
+                            try ed_ctx.onLineEdit(cursor_pos.row);
                         } else {
                             cursor_pos.row -= 1;
                             try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
@@ -520,6 +534,7 @@ pub fn main(init: std.process.Init) !void {
                                 line_len -= 1;
                             }
                             cursor_pos.column = line_len;
+                            try ed_ctx.onEdit();
                         }
                         force_render = true;
                     }
@@ -651,7 +666,7 @@ pub fn main(init: std.process.Init) !void {
                                     const total_char = rope.tree.root.summary.char_len;
                                     if (offset < total_char) {
                                         try rope.delete(offset, 1);
-                                        try ed_ctx.onEdit();
+                                        try ed_ctx.onLineEdit(cursor_pos.row);
                                         try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
                                         var line_len = line_buf.items.len;
                                         while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
@@ -798,7 +813,7 @@ pub fn main(init: std.process.Init) !void {
                 } else {
                     const offset = rope.pointToOffset(cursor_pos);
                     try rope.insert(offset, seq);
-                    try ed_ctx.onEdit();
+                    try ed_ctx.onLineEdit(cursor_pos.row);
                     cursor_pos.column += seq.len;
                     force_render = true;
                 }

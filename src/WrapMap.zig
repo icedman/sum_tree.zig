@@ -302,6 +302,10 @@ pub const WrapMap = struct {
             try self.wrapLine(i, rope);
         }
     }
+
+    pub fn updateLine(self: *Self, row: usize, rope: anytype) !void {
+        try self.wrapLine(row, rope);
+    }
 };
 
 pub fn expandTabs(allocator: std.mem.Allocator, text: []const u8, tab_size: usize, out: *std.ArrayList(u8)) !void {
