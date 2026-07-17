@@ -109,7 +109,7 @@ pub const WrapMap = struct {
         return (raw_len + self.wrap_width - 1) / self.wrap_width;
     }
 
-    pub fn bufferToDisplay(self: *Self, pt: BufferPoint) DisplayPoint {
+    pub fn bufferToDisplay(self: *Self, pt: BufferPoint, rope: anytype) DisplayPoint {
         if (self.tree.isEmpty()) {
             return .{ .row = 0, .col = 0 };
         }
@@ -118,8 +118,16 @@ pub const WrapMap = struct {
         cursor.seekTo(target, .right);
 
         const start_pos = cursor.position;
-        const offset = pt.column / self.wrap_width;
-        const col = pt.column % self.wrap_width;
+
+        // Retrieve line text to calculate tab expansion
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(self.allocator);
+        rope.lineText(pt.row, &buffer) catch {};
+
+        const expanded_col = rawToExpanded(buffer.items, pt.column, 4);
+
+        const offset = expanded_col / self.wrap_width;
+        const col = expanded_col % self.wrap_width;
 
         return .{
             .row = start_pos.display_rows + offset,
@@ -127,7 +135,7 @@ pub const WrapMap = struct {
         };
     }
 
-    pub fn displayToBuffer(self: *Self, pt: DisplayPoint) BufferPoint {
+    pub fn displayToBuffer(self: *Self, pt: DisplayPoint, rope: anytype) BufferPoint {
         if (self.tree.isEmpty()) {
             return .{ .row = 0, .column = 0 };
         }
@@ -140,19 +148,20 @@ pub const WrapMap = struct {
 
         const raw_row = start_pos.buffer_lines;
 
-        if (item) |wrap_entry| {
+        if (item) |_| {
             const line_row_offset = pt.row - start_pos.display_rows;
-            const char_col = line_row_offset * self.wrap_width + pt.col;
-            // Exclude the newline char at the end if it's there
-            const visible_chars = if (wrap_entry.raw_chars > 0 and wrap_entry.raw_chars == wrap_entry.display_rows * self.wrap_width)
-                wrap_entry.raw_chars
-            else if (wrap_entry.raw_chars > 0)
-                wrap_entry.raw_chars - 1
-            else
-                0;
+            const expanded_col = line_row_offset * self.wrap_width + pt.col;
+
+            // Retrieve line text to map expanded to raw column
+            var buffer = std.ArrayList(u8).empty;
+            defer buffer.deinit(self.allocator);
+            rope.lineText(raw_row, &buffer) catch {};
+
+            const raw_col = expandedToRaw(buffer.items, expanded_col, 4);
+
             return .{
                 .row = raw_row,
-                .column = @min(char_col, visible_chars),
+                .column = raw_col,
             };
         } else {
             const total_lines = self.tree.root.summary.buffer_lines;
@@ -229,7 +238,8 @@ pub const WrapMap = struct {
             try rope.lineText(i, &buffer);
             const text = buffer.items;
             const visible_len = if (text.len > 0 and text[text.len - 1] == '\n') text.len - 1 else text.len;
-            const display_rows = self.calculateDisplayRows(visible_len);
+            const expanded_len = rawToExpanded(text[0..visible_len], visible_len, 4);
+            const display_rows = self.calculateDisplayRows(expanded_len);
             try self.tree.push(LineWrapEntry{
                 .raw_chars = text.len,
                 .display_rows = display_rows,
@@ -237,3 +247,48 @@ pub const WrapMap = struct {
         }
     }
 };
+
+pub fn expandTabs(allocator: std.mem.Allocator, text: []const u8, tab_size: usize, out: *std.ArrayList(u8)) !void {
+    out.clearRetainingCapacity();
+    var col: usize = 0;
+    for (text) |char| {
+        if (char == '\t') {
+            const spaces = tab_size - (col % tab_size);
+            try out.appendNTimes(allocator, ' ', spaces);
+            col += spaces;
+        } else {
+            try out.append(allocator, char);
+            col += 1;
+        }
+    }
+}
+
+pub fn rawToExpanded(text: []const u8, raw_col: usize, tab_size: usize) usize {
+    var exp_col: usize = 0;
+    var i: usize = 0;
+    while (i < raw_col and i < text.len) : (i += 1) {
+        const char = text[i];
+        if (char == '\t') {
+            exp_col += tab_size - (exp_col % tab_size);
+        } else {
+            exp_col += 1;
+        }
+    }
+    return exp_col;
+}
+
+pub fn expandedToRaw(text: []const u8, exp_col: usize, tab_size: usize) usize {
+    var cur_exp: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (cur_exp >= exp_col) return i;
+        const char = text[i];
+        const next_exp = if (char == '\t') cur_exp + (tab_size - (cur_exp % tab_size)) else cur_exp + 1;
+        if (next_exp > exp_col) {
+            return i;
+        }
+        cur_exp = next_exp;
+        i += 1;
+    }
+    return i;
+}

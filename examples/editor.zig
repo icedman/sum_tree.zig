@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
             force_render = false;
 
             // Viewport Scroll Constraints
-            const display_cursor = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+            const display_cursor = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
             if (screen_height >= 3) {
                 if (display_cursor.row < viewport_offset.row) {
                     viewport_offset.row = display_cursor.row;
@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
             const render_limit = if (screen_height >= 2) screen_height - 2 else 0;
             while (r < render_limit) : (r += 1) {
                 const display_row = viewport_offset.row + r;
-                const start_pt = wrap_map.displayToBuffer(.{ .row = display_row, .col = 0 });
+                const start_pt = wrap_map.displayToBuffer(.{ .row = display_row, .col = 0 }, rope);
                 const total_lines = rope.tree.root.summary.line_len + 1;
 
                 if (start_pt.row < total_lines) {
@@ -177,13 +177,18 @@ pub fn main(init: std.process.Init) !void {
                     }
                     const clean_line = line_buf.items[0..text_len];
 
-                    const display_start_for_line = wrap_map.bufferToDisplay(.{ .row = start_pt.row, .column = 0 }).row;
+                    // Expand tabs to spaces
+                    var expanded_line = std.ArrayList(u8).empty;
+                    defer expanded_line.deinit(allocator);
+                    try sum_tree.expandTabs(allocator, clean_line, 4, &expanded_line);
+
+                    const display_start_for_line = wrap_map.bufferToDisplay(.{ .row = start_pt.row, .column = 0 }, rope).row;
                     const sub_row = display_row - display_start_for_line;
 
                     const char_start = sub_row * screen_width;
-                    if (char_start < clean_line.len) {
-                        const visible_len = @min(clean_line.len - char_start, screen_width);
-                        try render_buf.appendSlice(allocator, clean_line[char_start .. char_start + visible_len]);
+                    if (char_start < expanded_line.items.len) {
+                        const visible_len = @min(expanded_line.items.len - char_start, screen_width);
+                        try render_buf.appendSlice(allocator, expanded_line.items[char_start .. char_start + visible_len]);
                     }
                 }
                 try render_buf.appendSlice(allocator, "\x1b[K\r\n"); // Clear line and newline
@@ -391,43 +396,43 @@ pub fn main(init: std.process.Init) !void {
                 }
             },
             .up => {
-                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
                 if (disp_pos.row > 0) {
-                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row - 1, .col = disp_pos.col });
+                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row - 1, .col = disp_pos.col }, rope);
                     force_render = true;
                 }
             },
             .down => {
-                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
                 const total_display_rows = wrap_map.tree.root.summary.display_rows;
                 if (disp_pos.row + 1 < total_display_rows) {
-                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row + 1, .col = disp_pos.col });
+                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row + 1, .col = disp_pos.col }, rope);
                     force_render = true;
                 }
             },
             .home => {
-                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
-                cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = 0 });
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = 0 }, rope);
                 force_render = true;
             },
             .end => {
-                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
-                cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = screen_width - 1 });
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = screen_width - 1 }, rope);
                 force_render = true;
             },
             .page_up => {
-                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
                 const page = screen_height - 2;
                 const target_row = if (disp_pos.row > page) disp_pos.row - page else 0;
-                cursor_pos = wrap_map.displayToBuffer(.{ .row = target_row, .col = disp_pos.col });
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = target_row, .col = disp_pos.col }, rope);
                 force_render = true;
             },
             .page_down => {
-                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
                 const page = screen_height - 2;
                 const total_display_rows = wrap_map.tree.root.summary.display_rows;
                 const target_row = if (disp_pos.row + page < total_display_rows) disp_pos.row + page else (if (total_display_rows > 0) total_display_rows - 1 else 0);
-                cursor_pos = wrap_map.displayToBuffer(.{ .row = target_row, .col = disp_pos.col });
+                cursor_pos = wrap_map.displayToBuffer(.{ .row = target_row, .col = disp_pos.col }, rope);
                 force_render = true;
             },
             .right => {
@@ -587,17 +592,17 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 },
                                 'j' => {
-                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
                                     const total_display_rows = wrap_map.tree.root.summary.display_rows;
                                     if (disp_pos.row + 1 < total_display_rows) {
-                                        cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row + 1, .col = disp_pos.col });
+                                        cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row + 1, .col = disp_pos.col }, rope);
                                         force_render = true;
                                     }
                                 },
                                 'k' => {
-                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
                                     if (disp_pos.row > 0) {
-                                        cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row - 1, .col = disp_pos.col });
+                                        cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row - 1, .col = disp_pos.col }, rope);
                                         force_render = true;
                                     }
                                 },
@@ -630,13 +635,13 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 },
                                 '0' => {
-                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
-                                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = 0 });
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
+                                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = 0 }, rope);
                                     force_render = true;
                                 },
                                 '$' => {
-                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column });
-                                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = screen_width - 1 });
+                                    const disp_pos = wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
+                                    cursor_pos = wrap_map.displayToBuffer(.{ .row = disp_pos.row, .col = screen_width - 1 }, rope);
                                     force_render = true;
                                 },
                                 '^' => {

@@ -16,6 +16,9 @@ pub const WrapMap = @import("WrapMap.zig").WrapMap;
 pub const LineWrapEntry = @import("WrapMap.zig").LineWrapEntry;
 pub const BufferPoint = @import("WrapMap.zig").BufferPoint;
 pub const DisplayPoint = @import("WrapMap.zig").DisplayPoint;
+pub const expandTabs = @import("WrapMap.zig").expandTabs;
+pub const rawToExpanded = @import("WrapMap.zig").rawToExpanded;
+pub const expandedToRaw = @import("WrapMap.zig").expandedToRaw;
 pub const tests = @import("tests.zig");
 
 test {
