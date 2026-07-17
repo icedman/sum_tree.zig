@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     // Persist render_cursor outside main loop
     var render_cursor = RenderCursor.init(rope.tree);
 
+    var wrap_enabled = true;
     const init_size = try tui.getScreenSize();
     var wrap_map = try sum_tree.WrapMap.init(allocator, init_size.width);
     defer wrap_map.deinit();
@@ -77,11 +78,13 @@ pub fn main(init: std.process.Init) !void {
         rope: *Rope,
         render_cursor: *RenderCursor,
         tui: *Tui,
+        wrap_enabled: *bool,
         
         fn onEdit(self: @This()) !void {
             const size = try self.tui.getScreenSize();
             self.render_cursor.* = RenderCursor.init(self.rope.tree);
-            try self.wrap_map.rewrapAll(size.width, self.rope);
+            const target_width = if (self.wrap_enabled.*) size.width else 100000;
+            try self.wrap_map.rewrapAll(target_width, self.rope);
         }
     };
     const ed_ctx = EditorContext{
@@ -89,6 +92,7 @@ pub fn main(init: std.process.Init) !void {
         .rope = rope,
         .render_cursor = &render_cursor,
         .tui = tui,
+        .wrap_enabled = &wrap_enabled,
     };
 
     // Helper to get line text reusing the persistent render_cursor
@@ -136,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
             force_render = true;
             prev_screen_width = screen_width;
             prev_screen_height = screen_height;
-            try wrap_map.rewrapAll(screen_width, rope);
+            try wrap_map.rewrapAll(if (wrap_enabled) screen_width else 100000, rope);
         }
 
         const total_newlines = rope.tree.root.summary.line_len;
@@ -154,7 +158,16 @@ pub fn main(init: std.process.Init) !void {
                     viewport_offset.row = display_cursor.row - (screen_height - 3);
                 }
             }
-            viewport_offset.column = 0;
+            if (wrap_enabled) {
+                viewport_offset.column = 0;
+            } else {
+                if (display_cursor.col < viewport_offset.column) {
+                    viewport_offset.column = display_cursor.col;
+                }
+                if (display_cursor.col >= viewport_offset.column + screen_width) {
+                    viewport_offset.column = display_cursor.col - screen_width + 1;
+                }
+            }
 
             // Render Frame
             render_buf.clearRetainingCapacity();
@@ -185,7 +198,7 @@ pub fn main(init: std.process.Init) !void {
                     const display_start_for_line = (try wrap_map.bufferToDisplay(.{ .row = start_pt.row, .column = 0 }, rope)).row;
                     const sub_row = display_row - display_start_for_line;
 
-                    const char_start = sub_row * screen_width;
+                    const char_start = sub_row * (if (wrap_enabled) screen_width else wrap_map.wrap_width) + (if (wrap_enabled) 0 else viewport_offset.column);
                     if (char_start < expanded_line.items.len) {
                         const visible_len = @min(expanded_line.items.len - char_start, screen_width);
                         try render_buf.appendSlice(allocator, expanded_line.items[char_start .. char_start + visible_len]);
@@ -245,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
                 try tui.positionCursor(&render_buf, screen_height, command_input.items.len + 2);
             } else {
                 const screen_row = display_cursor.row - viewport_offset.row + 1;
-                const screen_col = display_cursor.col + 1;
+                const screen_col = display_cursor.col - viewport_offset.column + 1;
                 try tui.positionCursor(&render_buf, screen_row, screen_col);
             }
 
@@ -301,6 +314,22 @@ pub fn main(init: std.process.Init) !void {
                         try save_writer.flush();
 
                         break;
+                    } else if (std.mem.eql(u8, cmd, "set wrap")) {
+                        wrap_enabled = true;
+                        try wrap_map.rewrapAll(screen_width, rope);
+                        status_message = "Wrapping Enabled";
+                        status_timer = 2;
+                        current_mode = .normal;
+                        command_input.clearRetainingCapacity();
+                        force_render = true;
+                    } else if (std.mem.eql(u8, cmd, "set nowrap")) {
+                        wrap_enabled = false;
+                        try wrap_map.rewrapAll(100000, rope);
+                        status_message = "Wrapping Disabled";
+                        status_timer = 2;
+                        current_mode = .normal;
+                        command_input.clearRetainingCapacity();
+                        force_render = true;
                     } else {
                         status_message = "Unknown Command!";
                         status_timer = 2;
