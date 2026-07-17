@@ -573,23 +573,23 @@ test "WrapMap basic operations" {
 
     // Test bufferToDisplay translation
     // Line 0, char 0 ("h") -> Display row 0, col 0
-    const dp0 = wrap_map.bufferToDisplay(.{ .row = 0, .column = 0 }, rope);
+    const dp0 = try wrap_map.bufferToDisplay(.{ .row = 0, .column = 0 }, rope);
     try std.testing.expectEqual(@as(usize, 0), dp0.row);
     try std.testing.expectEqual(@as(usize, 0), dp0.col);
 
     // Line 0, char 6 ("w") -> Display row 1, col 1 (since 'hello ' is 6 chars, 6 / 5 = 1 row offset, 6 % 5 = 1 col offset)
-    const dp1 = wrap_map.bufferToDisplay(.{ .row = 0, .column = 6 }, rope);
+    const dp1 = try wrap_map.bufferToDisplay(.{ .row = 0, .column = 6 }, rope);
     try std.testing.expectEqual(@as(usize, 1), dp1.row);
     try std.testing.expectEqual(@as(usize, 1), dp1.col);
 
     // Test displayToBuffer translation
     // Display row 1, col 1 -> Line 0, char 6
-    const bp1 = wrap_map.displayToBuffer(.{ .row = 1, .col = 1 }, rope);
+    const bp1 = try wrap_map.displayToBuffer(.{ .row = 1, .col = 1 }, rope);
     try std.testing.expectEqual(@as(usize, 0), bp1.row);
     try std.testing.expectEqual(@as(usize, 6), bp1.column);
 
     // Display row 3, col 2 -> Line 1, char 2 ("s")
-    const bp2 = wrap_map.displayToBuffer(.{ .row = 3, .col = 2 }, rope);
+    const bp2 = try wrap_map.displayToBuffer(.{ .row = 3, .col = 2 }, rope);
     try std.testing.expectEqual(@as(usize, 1), bp2.row);
     try std.testing.expectEqual(@as(usize, 2), bp2.column);
 
@@ -605,11 +605,11 @@ test "WrapMap basic operations" {
 
     // "\t" starts at col 0, visual width 4
     // "A" is raw column 1, visual column 4
-    const dp_tab = wrap_map_tabs.bufferToDisplay(.{ .row = 0, .column = 1 }, rope_tabs);
+    const dp_tab = try wrap_map_tabs.bufferToDisplay(.{ .row = 0, .column = 1 }, rope_tabs);
     try std.testing.expectEqual(@as(usize, 0), dp_tab.row);
     try std.testing.expectEqual(@as(usize, 4), dp_tab.col);
 
-    const bp_tab = wrap_map_tabs.displayToBuffer(.{ .row = 0, .col = 4 }, rope_tabs);
+    const bp_tab = try wrap_map_tabs.displayToBuffer(.{ .row = 0, .col = 4 }, rope_tabs);
     try std.testing.expectEqual(@as(usize, 0), bp_tab.row);
     try std.testing.expectEqual(@as(usize, 1), bp_tab.column);
 }

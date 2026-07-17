@@ -88,6 +88,7 @@ pub const WrapMap = struct {
     allocator: Allocator,
     tree: *TreeType,
     wrap_width: usize,
+    wrapped_bitset: std.DynamicBitSet,
 
     pub fn init(allocator: Allocator, wrap_width: usize) !*Self {
         const self = try allocator.create(Self);
@@ -95,12 +96,14 @@ pub const WrapMap = struct {
             .allocator = allocator,
             .tree = try TreeType.init(allocator, {}),
             .wrap_width = wrap_width,
+            .wrapped_bitset = try std.DynamicBitSet.initEmpty(allocator, 0),
         };
         return self;
     }
 
     pub fn deinit(self: *Self) void {
         self.tree.deinit();
+        self.wrapped_bitset.deinit();
         self.allocator.destroy(self);
     }
 
@@ -109,12 +112,47 @@ pub const WrapMap = struct {
         return (raw_len + self.wrap_width - 1) / self.wrap_width;
     }
 
-    pub fn bufferToDisplay(self: *Self, pt: BufferPoint, rope: anytype) DisplayPoint {
+    fn isLineWrapped(self: *const Self, row: usize) bool {
+        if (row >= self.wrapped_bitset.capacity()) return false;
+        return self.wrapped_bitset.isSet(row);
+    }
+
+    fn wrapLine(self: *Self, row: usize, rope: anytype) !void {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(self.allocator);
+
+        try rope.lineText(row, &buffer);
+        const text = buffer.items;
+        const visible_len = if (text.len > 0 and text[text.len - 1] == '\n') text.len - 1 else text.len;
+        const expanded_len = rawToExpanded(text[0..visible_len], visible_len, 4);
+        const display_rows = self.calculateDisplayRows(expanded_len);
+
+        const entry = LineWrapEntry{
+            .raw_chars = text.len,
+            .display_rows = display_rows,
+        };
+
+        try self.replace(row, 1, &.{entry});
+
+        if (row >= self.wrapped_bitset.capacity()) {
+            const new_cap = @max(self.wrapped_bitset.capacity() * 2, row + 1);
+            try self.wrapped_bitset.resize(new_cap, false);
+        }
+        self.wrapped_bitset.set(row);
+    }
+
+    pub fn bufferToDisplay(self: *Self, pt: BufferPoint, rope: anytype) !DisplayPoint {
+        const total_lines = rope.tree.root.summary.line_len + 1;
+        const row = @min(pt.row, total_lines - 1);
+        if (!self.isLineWrapped(row)) {
+            try self.wrapLine(row, rope);
+        }
+
         if (self.tree.isEmpty()) {
             return .{ .row = 0, .col = 0 };
         }
         var cursor = TreeType.Cursor(WrapDimension).init(self.tree);
-        const target = BufferLineSeekTarget{ .target = pt.row };
+        const target = BufferLineSeekTarget{ .target = row };
         cursor.seekTo(target, .right);
 
         const start_pos = cursor.position;
@@ -122,7 +160,7 @@ pub const WrapMap = struct {
         // Retrieve line text to calculate tab expansion
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(self.allocator);
-        rope.lineText(pt.row, &buffer) catch {};
+        try rope.lineText(row, &buffer);
 
         const expanded_col = rawToExpanded(buffer.items, pt.column, 4);
 
@@ -135,47 +173,58 @@ pub const WrapMap = struct {
         };
     }
 
-    pub fn displayToBuffer(self: *Self, pt: DisplayPoint, rope: anytype) BufferPoint {
-        if (self.tree.isEmpty()) {
-            return .{ .row = 0, .column = 0 };
-        }
-        var cursor = TreeType.Cursor(WrapDimension).init(self.tree);
-        const target = DisplayRowSeekTarget{ .target = pt.row };
-        cursor.seekTo(target, .right);
-
-        const start_pos = cursor.position;
-        const item = cursor.item();
-
-        const raw_row = start_pos.buffer_lines;
-
-        if (item) |_| {
-            const line_row_offset = pt.row - start_pos.display_rows;
-            const expanded_col = line_row_offset * self.wrap_width + pt.col;
-
-            // Retrieve line text to map expanded to raw column
-            var buffer = std.ArrayList(u8).empty;
-            defer buffer.deinit(self.allocator);
-            rope.lineText(raw_row, &buffer) catch {};
-
-            const raw_col = expandedToRaw(buffer.items, expanded_col, 4);
-
-            return .{
-                .row = raw_row,
-                .column = raw_col,
-            };
-        } else {
-            const total_lines = self.tree.root.summary.buffer_lines;
-            if (total_lines > 0) {
-                cursor.reset();
-                cursor.seekTo(BufferLineSeekTarget{ .target = total_lines - 1 }, .right);
-                const last_entry = cursor.item().?;
-                const visible_chars = if (last_entry.raw_chars > 0) last_entry.raw_chars - 1 else 0;
-                return .{
-                    .row = total_lines - 1,
-                    .column = visible_chars,
-                };
+    pub fn displayToBuffer(self: *Self, pt: DisplayPoint, rope: anytype) !BufferPoint {
+        while (true) {
+            if (self.tree.isEmpty()) {
+                return .{ .row = 0, .column = 0 };
             }
-            return .{ .row = 0, .column = 0 };
+            var cursor = TreeType.Cursor(WrapDimension).init(self.tree);
+            const target = DisplayRowSeekTarget{ .target = pt.row };
+            cursor.seekTo(target, .right);
+
+            const start_pos = cursor.position;
+            const item = cursor.item();
+
+            const raw_row = start_pos.buffer_lines;
+
+            if (item) |_| {
+                if (!self.isLineWrapped(raw_row)) {
+                    try self.wrapLine(raw_row, rope);
+                    continue;
+                }
+                const line_row_offset = pt.row - start_pos.display_rows;
+                const expanded_col = line_row_offset * self.wrap_width + pt.col;
+
+                // Retrieve line text to map expanded to raw column
+                var buffer = std.ArrayList(u8).empty;
+                defer buffer.deinit(self.allocator);
+                try rope.lineText(raw_row, &buffer);
+
+                const raw_col = expandedToRaw(buffer.items, expanded_col, 4);
+
+                return .{
+                    .row = raw_row,
+                    .column = raw_col,
+                };
+            } else {
+                const total_lines = self.tree.root.summary.buffer_lines;
+                if (total_lines > 0) {
+                    const last_row = total_lines - 1;
+                    if (!self.isLineWrapped(last_row)) {
+                        try self.wrapLine(last_row, rope);
+                        continue;
+                    }
+                    cursor.reset();
+                    cursor.seekTo(BufferLineSeekTarget{ .target = last_row }, .right);
+                    const last_entry = cursor.item().?;
+                    const visible_chars = if (last_entry.raw_chars > 0) last_entry.raw_chars - 1 else 0;
+                    return .{
+                        .row = last_row,
+                        .column = visible_chars,
+                    };
+                }
+                return .{ .row = 0, .column = 0 };
+            }
         }
     }
 
@@ -192,18 +241,23 @@ pub const WrapMap = struct {
 
         const split_A = try self.tree.splitNode(WrapDimension, self.tree.root, start_target, .right, &cursor.position);
         errdefer split_A.left.deref(self.allocator);
-        defer split_A.right.deref(self.allocator);
+        errdefer split_A.right.deref(self.allocator);
 
         const left_tree = try TreeType.init(self.allocator, {});
         left_tree.root.deref(self.allocator);
         left_tree.root = split_A.left;
         defer left_tree.deinit();
 
-        var right_cursor = TreeType.Cursor(WrapDimension).init(split_A.right);
+        const split_A_right_tree = try TreeType.init(self.allocator, {});
+        split_A_right_tree.root.deref(self.allocator);
+        split_A_right_tree.root = split_A.right;
+        defer split_A_right_tree.deinit();
+
+        var right_cursor = TreeType.Cursor(WrapDimension).init(split_A_right_tree);
         const len_target = BufferLineSeekTarget{ .target = old_lines_count };
-        const split_B = try self.tree.splitNode(WrapDimension, split_A.right, len_target, .right, &right_cursor.position);
+        const split_B = try self.tree.splitNode(WrapDimension, split_A_right_tree.root, len_target, .right, &right_cursor.position);
         errdefer split_B.left.deref(self.allocator);
-        defer split_B.right.deref(self.allocator);
+        errdefer split_B.right.deref(self.allocator);
 
         split_B.left.deref(self.allocator);
 
@@ -229,21 +283,23 @@ pub const WrapMap = struct {
         self.tree = try TreeType.init(self.allocator, {});
         old_tree.deinit();
 
-        var buffer = std.ArrayList(u8).empty;
-        defer buffer.deinit(self.allocator);
-
         const total_lines = rope.tree.root.summary.line_len + 1;
+        self.wrapped_bitset.deinit();
+        self.wrapped_bitset = try std.DynamicBitSet.initEmpty(self.allocator, total_lines);
+
         var i: usize = 0;
         while (i < total_lines) : (i += 1) {
-            try rope.lineText(i, &buffer);
-            const text = buffer.items;
-            const visible_len = if (text.len > 0 and text[text.len - 1] == '\n') text.len - 1 else text.len;
-            const expanded_len = rawToExpanded(text[0..visible_len], visible_len, 4);
-            const display_rows = self.calculateDisplayRows(expanded_len);
             try self.tree.push(LineWrapEntry{
-                .raw_chars = text.len,
-                .display_rows = display_rows,
+                .raw_chars = 10,
+                .display_rows = 1,
             });
+        }
+
+        var limit: usize = 100;
+        if (limit > total_lines) limit = total_lines;
+        i = 0;
+        while (i < limit) : (i += 1) {
+            try self.wrapLine(i, rope);
         }
     }
 };

@@ -272,7 +272,7 @@ pub fn SumTree(comptime Item: type) type {
             return curr;
         }
 
-        fn splitNode(self: *Self, comptime Dim: type, node: *Node, target: anytype, bias: Bias, position: *Dim) anyerror!SplitNodes {
+        pub fn splitNode(self: *Self, comptime Dim: type, node: *Node, target: anytype, bias: Bias, position: *Dim) anyerror!SplitNodes {
             const res = try self.splitNodeRec(Dim, node, target, bias, position);
             errdefer {
                 res.left.deref(self.allocator);
