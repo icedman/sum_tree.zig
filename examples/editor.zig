@@ -8,6 +8,49 @@ const Key = tui_lib.Key;
 
 const Allocator = std.mem.Allocator;
 const RenderCursor = sum_tree.SumTree(sum_tree.RopeChunk).Cursor(sum_tree.RopeChunk.Summary);
+fn getLineWordStarts(allocator: Allocator, line: []const u8) !std.ArrayList(usize) {
+    var starts = std.ArrayList(usize).empty;
+    errdefer starts.deinit(allocator);
+
+    var idx: usize = 0;
+    while (idx < line.len) {
+        const c = line[idx];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            idx += 1;
+            continue;
+        }
+
+        // Start of a word or punctuation sequence
+        try starts.append(allocator, idx);
+
+        const start_class_word = std.ascii.isAlphanumeric(c) or c == '_';
+        idx += 1;
+        while (idx < line.len) {
+            const next_c = line[idx];
+            if (next_c == ' ' or next_c == '\t' or next_c == '\n' or next_c == '\r') {
+                break;
+            }
+            const next_class_word = std.ascii.isAlphanumeric(next_c) or next_c == '_';
+            if (next_class_word != start_class_word) {
+                break; // Transition between word and punctuation
+            }
+            idx += 1;
+        }
+    }
+    return starts;
+}
+
+fn capCursor(r: *Rope, pos: *Point, is_normal: bool) !void {
+    var line_buf = std.ArrayList(u8).empty;
+    defer line_buf.deinit(r.allocator);
+    try r.lineText(pos.row, &line_buf);
+    var line_len = line_buf.items.len;
+    while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
+        line_len -= 1;
+    }
+    const max_col = if (is_normal) (if (line_len > 0) line_len - 1 else 0) else line_len;
+    pos.column = @min(pos.column, max_col);
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -628,7 +671,8 @@ pub fn main(init: std.process.Init) !void {
                             if (c == 'h' or c == 'j' or c == 'k' or c == 'l' or
                                 c == '0' or c == '$' or c == '^' or
                                 c == '{' or c == '}' or c == 'g' or c == 'G' or
-                                c == 'v' or c == 'V' or c == ':')
+                                c == 'v' or c == 'V' or c == ':' or
+                                c == 'w' or c == 'b')
                             {
                                 // fall through
                             } else {
@@ -740,6 +784,87 @@ pub fn main(init: std.process.Init) !void {
                                         cursor_pos.column += 1;
                                         force_render = true;
                                     }
+                                },
+                                'w' => {
+                                    try capCursor(rope, &cursor_pos, current_mode == .normal);
+
+                                    // Get current line text
+                                    try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
+                                    var line_len = line_buf.items.len;
+                                    while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
+                                        line_len -= 1;
+                                    }
+                                    const line_text = line_buf.items[0..line_len];
+
+                                    // Parse word starts
+                                    var starts = try getLineWordStarts(allocator, line_text);
+                                    defer starts.deinit(allocator);
+
+                                    // Find next word start
+                                    var next_col: ?usize = null;
+                                    for (starts.items) |start| {
+                                        if (start > cursor_pos.column) {
+                                            next_col = start;
+                                            break;
+                                        }
+                                    }
+
+                                    if (next_col) |col| {
+                                        cursor_pos.column = col;
+                                    } else {
+                                        // Go to next line column 0
+                                        if (cursor_pos.row < total_newlines) {
+                                            cursor_pos.row += 1;
+                                            cursor_pos.column = 0;
+                                        }
+                                    }
+                                    force_render = true;
+                                },
+                                'b' => {
+                                    try capCursor(rope, &cursor_pos, current_mode == .normal);
+
+                                    if (cursor_pos.column == 0) {
+                                        // Move to previous line at last column
+                                        if (cursor_pos.row > 0) {
+                                            cursor_pos.row -= 1;
+                                            try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
+                                            var prev_len = line_buf.items.len;
+                                            while (prev_len > 0 and (line_buf.items[prev_len - 1] == '\n' or line_buf.items[prev_len - 1] == '\r')) {
+                                                prev_len -= 1;
+                                            }
+                                            const max_col = if (current_mode == .normal) (if (prev_len > 0) prev_len - 1 else 0) else prev_len;
+                                            cursor_pos.column = max_col;
+                                        }
+                                    } else {
+                                        // Get current line text
+                                        try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
+                                        var line_len = line_buf.items.len;
+                                        while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
+                                            line_len -= 1;
+                                        }
+                                        const line_text = line_buf.items[0..line_len];
+
+                                        var starts = try getLineWordStarts(allocator, line_text);
+                                        defer starts.deinit(allocator);
+
+                                        // Find the last start offset that is strictly less than current column
+                                        var prev_col: ?usize = null;
+                                        for (starts.items) |start| {
+                                            if (start < cursor_pos.column) {
+                                                prev_col = start;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+
+                                        if (prev_col) |col| {
+                                            cursor_pos.column = col;
+                                        } else {
+                                            // Move to start of current line
+                                            cursor_pos.column = 0;
+                                        }
+                                    }
+                                    force_render = true;
                                 },
                                 'x' => {
                                     const offset = rope.pointToOffset(cursor_pos);

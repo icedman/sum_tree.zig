@@ -636,3 +636,49 @@ test "SelectionManager basic operations and normalization" {
     try std.testing.expectEqual(@as(usize, 5), sm.selections.items[0].start());
     try std.testing.expectEqual(@as(usize, 20), sm.selections.items[0].end());
 }
+
+test "Word navigation w and b" {
+    const allocator = std.testing.allocator;
+    const getLineWordStartsHelper = struct {
+        fn call(alloc: std.mem.Allocator, line: []const u8) !std.ArrayList(usize) {
+            var starts = std.ArrayList(usize).empty;
+            errdefer starts.deinit(alloc);
+
+            var idx: usize = 0;
+            while (idx < line.len) {
+                const c = line[idx];
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                    idx += 1;
+                    continue;
+                }
+
+                try starts.append(alloc, idx);
+
+                const start_class_word = std.ascii.isAlphanumeric(c) or c == '_';
+                idx += 1;
+                while (idx < line.len) {
+                    const next_c = line[idx];
+                    if (next_c == ' ' or next_c == '\t' or next_c == '\n' or next_c == '\r') {
+                        break;
+                    }
+                    const next_class_word = std.ascii.isAlphanumeric(next_c) or next_c == '_';
+                    if (next_class_word != start_class_word) {
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
+            return starts;
+        }
+    }.call;
+
+    var starts = try getLineWordStartsHelper(allocator, "hello, world!  foo");
+    defer starts.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), starts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), starts.items[0]);
+    try std.testing.expectEqual(@as(usize, 5), starts.items[1]);
+    try std.testing.expectEqual(@as(usize, 7), starts.items[2]);
+    try std.testing.expectEqual(@as(usize, 12), starts.items[3]);
+    try std.testing.expectEqual(@as(usize, 15), starts.items[4]);
+}

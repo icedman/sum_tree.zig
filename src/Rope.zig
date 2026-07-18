@@ -345,6 +345,23 @@ pub const Rope = struct {
         return cursor.position.char_len + local_char_offset + point.column;
     }
 
+    pub fn charAt(self: *const Self, offset: usize) ?u8 {
+        const total_char = self.tree.root.summary.char_len;
+        if (offset >= total_char) return null;
+
+        var cursor = S.Cursor(RopeChunk.Summary).init(self.tree);
+        const target = CharSeekTarget{ .target = offset };
+        cursor.seekTo(target, .left);
+
+        if (cursor.item()) |chunk| {
+            const local_offset = offset - cursor.position.char_len;
+            if (local_offset < chunk.text.slice().len) {
+                return chunk.text.slice()[local_offset];
+            }
+        }
+        return null;
+    }
+
     pub fn offsetToPoint(self: *Self, offset: usize) Point {
         var cursor = S.Cursor(RopeChunk.Summary).init(self.tree);
         const target = CharSeekTarget{ .target = offset };
