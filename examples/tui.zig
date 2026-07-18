@@ -21,6 +21,7 @@ pub const Key = union(enum) {
     backspace,
     enter,
     ctrl_c,
+    ctrl_d,
     ctrl_q,
     ctrl_s,
     ctrl_z,
@@ -128,6 +129,7 @@ pub const Tui = struct {
         } else if (seq[0] < 32) {
             return switch (seq[0]) {
                 3 => .ctrl_c,
+                4 => .ctrl_d,
                 17 => .ctrl_q,
                 18 => .ctrl_r,
                 19 => .ctrl_s,

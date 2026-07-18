@@ -181,6 +181,14 @@ pub fn main(init: std.process.Init) !void {
     defer selection_manager.deinit();
     var visual_anchor_pos = Point{ .row = 0, .column = 0 };
 
+    const SavedCursor = struct {
+        pos: Point,
+        visual_anchor: ?Point,
+        mode: Mode,
+    };
+    var saved_cursors = std.ArrayList(SavedCursor).empty;
+    defer saved_cursors.deinit(allocator);
+
     // 4. Main Event Loop
     while (true) {
         // Query Terminal Size via Tui helper
@@ -223,6 +231,33 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 const offset = rope.pointToOffset(cursor_pos);
                 try selection_manager.addSelection(offset, offset);
+            }
+
+            for (saved_cursors.items) |sc| {
+                if (sc.visual_anchor) |anchor| {
+                    if (sc.mode == .visual) {
+                        const total_char = rope.tree.root.summary.char_len;
+                        const head = rope.pointToOffset(sc.pos);
+                        const tail = rope.pointToOffset(anchor);
+                        if (head >= tail) {
+                            try selection_manager.addSelection(@min(head + 1, total_char), tail);
+                        } else {
+                            try selection_manager.addSelection(head, @min(tail + 1, total_char));
+                        }
+                    } else if (sc.mode == .visual_line) {
+                        const min_row = @min(sc.pos.row, anchor.row);
+                        const max_row = @max(sc.pos.row, anchor.row);
+                        const start_offset = rope.pointToOffset(Point{ .row = min_row, .column = 0 });
+                        const end_offset = if (max_row >= total_newlines)
+                            rope.tree.root.summary.char_len
+                        else
+                            rope.pointToOffset(Point{ .row = max_row + 1, .column = 0 });
+                        try selection_manager.addSelection(start_offset, end_offset);
+                    }
+                } else {
+                    const offset = rope.pointToOffset(sc.pos);
+                    try selection_manager.addSelection(offset, offset);
+                }
             }
 
             // Viewport Scroll Constraints
@@ -280,12 +315,23 @@ pub fn main(init: std.process.Init) !void {
                         const char_offset = line_start_offset + raw_idx;
                         const is_selected = selection_manager.isOffsetSelected(char_offset);
 
+                        var is_secondary = false;
+                        for (saved_cursors.items) |sc| {
+                            const sc_offset = rope.pointToOffset(sc.pos);
+                            if (sc_offset == char_offset) {
+                                is_secondary = true;
+                                break;
+                            }
+                        }
+
                         const spaces = if (char == '\t') 4 - (col % 4) else 1;
                         var s: usize = 0;
                         while (s < spaces) : (s += 1) {
                             const exp_col = col + s;
                             if (exp_col >= char_start and exp_col < char_start + screen_width) {
-                                if (is_selected) {
+                                if (is_secondary) {
+                                    try render_buf.appendSlice(allocator, "\x1b[7m");
+                                } else if (is_selected) {
                                     try render_buf.appendSlice(allocator, "\x1b[48;5;239m");
                                 }
                                 if (char == '\t') {
@@ -293,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
                                 } else {
                                     try render_buf.append(allocator, char);
                                 }
-                                if (is_selected) {
+                                if (is_secondary or is_selected) {
                                     try render_buf.appendSlice(allocator, "\x1b[m");
                                 }
                             }
@@ -303,9 +349,22 @@ pub fn main(init: std.process.Init) !void {
 
                     // Highlight selected newline at end of line (rendered as a single highlighted space)
                     const newline_offset = line_start_offset + clean_line.len;
-                    if (selection_manager.isOffsetSelected(newline_offset)) {
+                    var newline_secondary = false;
+                    for (saved_cursors.items) |sc| {
+                        const sc_offset = rope.pointToOffset(sc.pos);
+                        if (sc_offset == newline_offset) {
+                            newline_secondary = true;
+                            break;
+                        }
+                    }
+
+                    if (newline_secondary or selection_manager.isOffsetSelected(newline_offset)) {
                         if (col >= char_start and col < char_start + screen_width) {
-                            try render_buf.appendSlice(allocator, "\x1b[48;5;239m \x1b[m");
+                            if (newline_secondary) {
+                                try render_buf.appendSlice(allocator, "\x1b[7m \x1b[m");
+                            } else {
+                                try render_buf.appendSlice(allocator, "\x1b[48;5;239m \x1b[m");
+                            }
                         }
                     }
                 }
@@ -519,15 +578,26 @@ pub fn main(init: std.process.Init) !void {
                     force_render = true;
                 }
             },
+            .ctrl_d => {
+                const has_selection = (current_mode == .visual or current_mode == .visual_line);
+                try saved_cursors.append(allocator, .{
+                    .pos = cursor_pos,
+                    .visual_anchor = if (has_selection) visual_anchor_pos else null,
+                    .mode = current_mode,
+                });
+                current_mode = .normal;
+                force_render = true;
+            },
             .escape => {
+                saved_cursors.clearRetainingCapacity();
                 if (current_mode != .normal) {
                     current_mode = .normal;
                     pending_op = null;
                     if (cursor_pos.column > 0) {
                         cursor_pos.column -= 1;
                     }
-                    force_render = true;
                 }
+                force_render = true;
             },
             .up => {
                 const disp_pos = try wrap_map.bufferToDisplay(.{ .row = cursor_pos.row, .column = cursor_pos.column }, rope);
