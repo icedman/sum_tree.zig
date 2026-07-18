@@ -52,6 +52,176 @@ fn capCursor(r: *Rope, pos: *Point, is_normal: bool) !void {
     pos.column = @min(pos.column, max_col);
 }
 
+const Mode = enum {
+    normal,
+    insert,
+    visual,
+    visual_line,
+    command,
+};
+
+const SavedCursor = struct {
+    pos: Point,
+    visual_anchor: ?Point,
+    mode: Mode,
+};
+
+fn getSelectionRange(r: *Rope, pos: Point, anchor: ?Point, mode: Mode) struct { start: usize, end: usize } {
+    const total_char = r.tree.root.summary.char_len;
+    const total_newlines = r.tree.root.summary.line_len;
+    if (anchor) |anc| {
+        if (mode == .visual) {
+            const head = r.pointToOffset(pos);
+            const tail = r.pointToOffset(anc);
+            const start = @min(head, tail);
+            const end = @min(@max(head, tail) + 1, total_char);
+            return .{ .start = start, .end = end };
+        } else if (mode == .visual_line) {
+            const min_row = @min(pos.row, anc.row);
+            const max_row = @max(pos.row, anc.row);
+            const start = r.pointToOffset(Point{ .row = min_row, .column = 0 });
+            const end = if (max_row >= total_newlines)
+                total_char
+            else
+                r.pointToOffset(Point{ .row = max_row + 1, .column = 0 });
+            return .{ .start = start, .end = end };
+        }
+    }
+    const offset = r.pointToOffset(pos);
+    return .{ .start = offset, .end = offset };
+}
+
+const Replacement = struct {
+    cursor_idx: usize,
+    start: usize,
+    end: usize,
+    insert_text: []const u8,
+};
+
+fn applyMultiCursorReplacement(
+    rope: *Rope,
+    saved_cursors: *std.ArrayList(SavedCursor),
+    primary_pos: *Point,
+    primary_anchor: ?*Point,
+    allocator: Allocator,
+    replacements: []const Replacement,
+    push_at_start: bool,
+) !void {
+    if (replacements.len == 0) return;
+
+    const CursorOffsets = struct {
+        pos: usize,
+        anchor: ?usize,
+    };
+    var offsets = try allocator.alloc(CursorOffsets, 1 + saved_cursors.items.len);
+    defer allocator.free(offsets);
+
+    offsets[0] = .{
+        .pos = rope.pointToOffset(primary_pos.*),
+        .anchor = if (primary_anchor) |pa| rope.pointToOffset(pa.*) else null,
+    };
+    for (saved_cursors.items, 0..) |sc, idx| {
+        offsets[idx + 1] = .{
+            .pos = rope.pointToOffset(sc.pos),
+            .anchor = if (sc.visual_anchor) |va| rope.pointToOffset(va) else null,
+        };
+    }
+
+    var sorted_reps = std.ArrayList(Replacement).empty;
+    defer sorted_reps.deinit(allocator);
+    try sorted_reps.appendSlice(allocator, replacements);
+
+    const sort_func = struct {
+        fn lessThan(_: void, lhs: Replacement, rhs: Replacement) bool {
+            return lhs.start > rhs.start;
+        }
+    }.lessThan;
+    std.mem.sort(Replacement, sorted_reps.items, {}, sort_func);
+
+    rope.setEnableHistory(false);
+    defer rope.setEnableHistory(true);
+
+    for (sorted_reps.items) |rep| {
+        const del_len = rep.end - rep.start;
+        if (del_len > 0) {
+            try rope.delete(rep.start, del_len);
+        }
+        if (rep.insert_text.len > 0) {
+            try rope.insert(rep.start, rep.insert_text);
+        }
+
+        const delta_len = @as(isize, @intCast(rep.insert_text.len)) - @as(isize, @intCast(del_len));
+        for (offsets) |*off| {
+            // Adjust pos
+            if (off.pos > rep.start) {
+                if (off.pos < rep.end) {
+                    off.pos = rep.start;
+                } else {
+                    off.pos = @as(usize, @intCast(@as(isize, @intCast(off.pos)) + delta_len));
+                }
+            } else if (off.pos == rep.start) {
+                if (push_at_start) {
+                    off.pos = @as(usize, @intCast(@as(isize, @intCast(off.pos)) + @as(isize, @intCast(rep.insert_text.len))));
+                }
+            }
+
+            // Adjust anchor
+            if (off.anchor) |*anchor| {
+                if (anchor.* > rep.start) {
+                    if (anchor.* < rep.end) {
+                        anchor.* = rep.start;
+                    } else {
+                        anchor.* = @as(usize, @intCast(@as(isize, @intCast(anchor.*)) + delta_len));
+                    }
+                } else if (anchor.* == rep.start) {
+                    if (push_at_start) {
+                        anchor.* = @as(usize, @intCast(@as(isize, @intCast(anchor.*)) + @as(isize, @intCast(rep.insert_text.len))));
+                    }
+                }
+            }
+        }
+    }
+
+    try rope.tree.saveHistory(offsets[0].pos);
+
+    primary_pos.* = rope.offsetToPoint(offsets[0].pos);
+    if (primary_anchor) |pa| {
+        if (offsets[0].anchor) |anc| {
+            pa.* = rope.offsetToPoint(anc);
+        }
+    }
+
+    for (saved_cursors.items, 0..) |*sc, idx| {
+        sc.pos = rope.offsetToPoint(offsets[idx + 1].pos);
+        if (sc.visual_anchor) |*va| {
+            if (offsets[idx + 1].anchor) |anc| {
+                va.* = rope.offsetToPoint(anc);
+            }
+        }
+    }
+
+    var i: usize = 0;
+    while (i < saved_cursors.items.len) {
+        const sc = saved_cursors.items[i];
+        var dup = (sc.pos.row == primary_pos.row and sc.pos.column == primary_pos.column);
+        if (!dup) {
+            var j: usize = 0;
+            while (j < i) : (j += 1) {
+                const prev = saved_cursors.items[j];
+                if (prev.pos.row == sc.pos.row and prev.pos.column == sc.pos.column) {
+                    dup = true;
+                    break;
+                }
+            }
+        }
+        if (dup) {
+            _ = saved_cursors.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = std.heap.smp_allocator;
@@ -164,14 +334,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }.call;
 
-    // Vim Modes
-    const Mode = enum {
-        normal,
-        insert,
-        visual,
-        visual_line,
-        command,
-    };
     var current_mode = Mode.normal;
     var pending_op: ?u8 = null;
     var command_input = std.ArrayList(u8).empty;
@@ -181,11 +343,6 @@ pub fn main(init: std.process.Init) !void {
     defer selection_manager.deinit();
     var visual_anchor_pos = Point{ .row = 0, .column = 0 };
 
-    const SavedCursor = struct {
-        pos: Point,
-        visual_anchor: ?Point,
-        mode: Mode,
-    };
     var saved_cursors = std.ArrayList(SavedCursor).empty;
     defer saved_cursors.deinit(allocator);
 
@@ -671,53 +828,99 @@ pub fn main(init: std.process.Init) !void {
             },
             .delete => {
                 if (current_mode == .insert) {
-                    const offset = rope.pointToOffset(cursor_pos);
+                    var reps = std.ArrayList(Replacement).empty;
+                    defer reps.deinit(allocator);
+
                     const total_char = rope.tree.root.summary.char_len;
-                    if (offset < total_char) {
-                        try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                        var line_len = line_buf.items.len;
-                        while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                            line_len -= 1;
+                    
+                    const p_off = rope.pointToOffset(cursor_pos);
+                    if (p_off < total_char) {
+                        try reps.append(allocator, .{
+                            .cursor_idx = 0,
+                            .start = p_off,
+                            .end = p_off + 1,
+                            .insert_text = "",
+                        });
+                    }
+
+                    for (saved_cursors.items, 0..) |sc, idx| {
+                        const sc_off = rope.pointToOffset(sc.pos);
+                        if (sc_off < total_char) {
+                            try reps.append(allocator, .{
+                                .cursor_idx = idx + 1,
+                                .start = sc_off,
+                                .end = sc_off + 1,
+                                .insert_text = "",
+                            });
                         }
-                        try rope.delete(offset, 1);
-                        if (cursor_pos.column < line_len) {
-                            try ed_ctx.onLineEdit(cursor_pos.row);
-                        } else {
-                            try ed_ctx.onEdit();
-                        }
+                    }
+
+                    if (reps.items.len > 0) {
+                        try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
+                        try ed_ctx.onEdit();
                         force_render = true;
                     }
                 }
             },
             .backspace => {
                 if (current_mode == .insert) {
-                    if (cursor_pos.row > 0 or cursor_pos.column > 0) {
-                        const offset = rope.pointToOffset(cursor_pos);
-                        try rope.delete(offset - 1, 1);
-                        if (cursor_pos.column > 0) {
-                            cursor_pos.column -= 1;
-                            try ed_ctx.onLineEdit(cursor_pos.row);
-                        } else {
-                            cursor_pos.row -= 1;
-                            try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                            var line_len = line_buf.items.len;
-                            while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                                line_len -= 1;
-                            }
-                            cursor_pos.column = line_len;
-                            try ed_ctx.onEdit();
+                    var reps = std.ArrayList(Replacement).empty;
+                    defer reps.deinit(allocator);
+
+                    const p_off = rope.pointToOffset(cursor_pos);
+                    if (p_off > 0) {
+                        try reps.append(allocator, .{
+                            .cursor_idx = 0,
+                            .start = p_off - 1,
+                            .end = p_off,
+                            .insert_text = "",
+                        });
+                    }
+
+                    for (saved_cursors.items, 0..) |sc, idx| {
+                        const sc_off = rope.pointToOffset(sc.pos);
+                        if (sc_off > 0) {
+                            try reps.append(allocator, .{
+                                .cursor_idx = idx + 1,
+                                .start = sc_off - 1,
+                                .end = sc_off,
+                                .insert_text = "",
+                            });
                         }
+                    }
+
+                    if (reps.items.len > 0) {
+                        try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
+                        try ed_ctx.onEdit();
                         force_render = true;
                     }
                 }
             },
             .enter => {
                 if (current_mode == .insert) {
-                    const offset = rope.pointToOffset(cursor_pos);
-                    try rope.insert(offset, "\n");
+                    var reps = std.ArrayList(Replacement).empty;
+                    defer reps.deinit(allocator);
+
+                    const p_off = rope.pointToOffset(cursor_pos);
+                    try reps.append(allocator, .{
+                        .cursor_idx = 0,
+                        .start = p_off,
+                        .end = p_off,
+                        .insert_text = "\n",
+                    });
+
+                    for (saved_cursors.items, 0..) |sc, idx| {
+                        const sc_off = rope.pointToOffset(sc.pos);
+                        try reps.append(allocator, .{
+                            .cursor_idx = idx + 1,
+                            .start = sc_off,
+                            .end = sc_off,
+                            .insert_text = "\n",
+                        });
+                    }
+
+                    try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
                     try ed_ctx.onEdit();
-                    cursor_pos.row += 1;
-                    cursor_pos.column = 0;
                     force_render = true;
                 }
             },
@@ -728,12 +931,40 @@ pub fn main(init: std.process.Init) !void {
                         const c = seq[0];
                         if (current_mode == .visual or current_mode == .visual_line) {
                             if (c == 'd' or c == 'x') {
-                                if (selection_manager.getPrimary()) |sel| {
-                                    try rope.delete(sel.start(), sel.end() - sel.start());
+                                var reps = std.ArrayList(Replacement).empty;
+                                defer reps.deinit(allocator);
+
+                                const p_range = getSelectionRange(rope, cursor_pos, visual_anchor_pos, current_mode);
+                                if (p_range.end > p_range.start) {
+                                    try reps.append(allocator, .{
+                                        .cursor_idx = 0,
+                                        .start = p_range.start,
+                                        .end = p_range.end,
+                                        .insert_text = "",
+                                    });
+                                }
+
+                                for (saved_cursors.items, 0..) |sc, idx| {
+                                    const sc_range = getSelectionRange(rope, sc.pos, sc.visual_anchor, sc.mode);
+                                    if (sc_range.end > sc_range.start) {
+                                        try reps.append(allocator, .{
+                                            .cursor_idx = idx + 1,
+                                            .start = sc_range.start,
+                                            .end = sc_range.end,
+                                            .insert_text = "",
+                                        });
+                                    }
+                                }
+
+                                if (reps.items.len > 0) {
+                                    try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, &visual_anchor_pos, allocator, reps.items, true);
                                     current_mode = .normal;
                                     try ed_ctx.onEdit();
-                                    const total_char = rope.tree.root.summary.char_len;
-                                    cursor_pos = rope.offsetToPoint(@min(sel.start(), total_char));
+                                    
+                                    try capCursor(rope, &cursor_pos, true);
+                                    for (saved_cursors.items) |*sc| {
+                                        try capCursor(rope, &sc.pos, true);
+                                    }
                                     force_render = true;
                                 }
                                 continue;
@@ -751,24 +982,49 @@ pub fn main(init: std.process.Init) !void {
                         }
                         if (pending_op) |op| {
                             if (op == 'd' and c == 'd') {
-                                // dd: delete current line
-                                try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                                const start_offset = rope.pointToOffset(Point{ .row = cursor_pos.row, .column = 0 });
+                                var reps = std.ArrayList(Replacement).empty;
+                                defer reps.deinit(allocator);
 
-                                const end_offset = if (cursor_pos.row >= total_newlines)
+                                // Primary cursor line range
+                                const p_start = rope.pointToOffset(Point{ .row = cursor_pos.row, .column = 0 });
+                                const p_end = if (cursor_pos.row >= total_newlines)
                                     rope.tree.root.summary.char_len
                                 else
                                     rope.pointToOffset(Point{ .row = cursor_pos.row + 1, .column = 0 });
+                                if (p_end > p_start) {
+                                    try reps.append(allocator, .{
+                                        .cursor_idx = 0,
+                                        .start = p_start,
+                                        .end = p_end,
+                                        .insert_text = "",
+                                    });
+                                }
 
-                                if (end_offset > start_offset) {
-                                    try rope.delete(start_offset, end_offset - start_offset);
-                                    try ed_ctx.onEdit();
-                                    // Recalculate line count after deletion
-                                    const new_newlines = rope.tree.root.summary.line_len;
-                                    if (cursor_pos.row > 0 and cursor_pos.row >= new_newlines) {
-                                        cursor_pos.row = new_newlines;
+                                // Saved cursors line ranges
+                                for (saved_cursors.items, 0..) |sc, idx| {
+                                    const sc_start = rope.pointToOffset(Point{ .row = sc.pos.row, .column = 0 });
+                                    const sc_end = if (sc.pos.row >= total_newlines)
+                                        rope.tree.root.summary.char_len
+                                    else
+                                        rope.pointToOffset(Point{ .row = sc.pos.row + 1, .column = 0 });
+                                    if (sc_end > sc_start) {
+                                        try reps.append(allocator, .{
+                                            .cursor_idx = idx + 1,
+                                            .start = sc_start,
+                                            .end = sc_end,
+                                            .insert_text = "",
+                                        });
                                     }
-                                    cursor_pos.column = 0;
+                                }
+
+                                if (reps.items.len > 0) {
+                                    try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
+                                    try ed_ctx.onEdit();
+                                    
+                                    try capCursor(rope, &cursor_pos, true);
+                                    for (saved_cursors.items) |*sc| {
+                                        try capCursor(rope, &sc.pos, true);
+                                    }
                                     force_render = true;
                                 }
                                 pending_op = null;
@@ -799,28 +1055,80 @@ pub fn main(init: std.process.Init) !void {
                                     force_render = true;
                                 },
                                 'o' => {
+                                    var reps = std.ArrayList(Replacement).empty;
+                                    defer reps.deinit(allocator);
+
+                                    // For primary cursor
                                     try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                                    var line_len = line_buf.items.len;
-                                    while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                                        line_len -= 1;
+                                    var p_line_len = line_buf.items.len;
+                                    while (p_line_len > 0 and (line_buf.items[p_line_len - 1] == '\n' or line_buf.items[p_line_len - 1] == '\r')) {
+                                        p_line_len -= 1;
                                     }
-                                    cursor_pos.column = line_len;
-                                    const offset = rope.pointToOffset(cursor_pos);
-                                    try rope.insert(offset, "\n");
-                                    try ed_ctx.onEdit();
-                                    cursor_pos.row += 1;
-                                    cursor_pos.column = 0;
-                                    current_mode = .insert;
-                                    force_render = true;
+                                    cursor_pos.column = p_line_len;
+                                    const p_offset = rope.pointToOffset(cursor_pos);
+                                    try reps.append(allocator, .{
+                                        .cursor_idx = 0,
+                                        .start = p_offset,
+                                        .end = p_offset,
+                                        .insert_text = "\n",
+                                    });
+
+                                    // For saved cursors
+                                    for (saved_cursors.items, 0..) |*sc, idx| {
+                                        try getLineText(rope, &render_cursor, sc.pos.row, &line_buf);
+                                        var sc_line_len = line_buf.items.len;
+                                        while (sc_line_len > 0 and (line_buf.items[sc_line_len - 1] == '\n' or line_buf.items[sc_line_len - 1] == '\r')) {
+                                            sc_line_len -= 1;
+                                        }
+                                        sc.pos.column = sc_line_len;
+                                        const sc_offset = rope.pointToOffset(sc.pos);
+                                        try reps.append(allocator, .{
+                                            .cursor_idx = idx + 1,
+                                            .start = sc_offset,
+                                            .end = sc_offset,
+                                            .insert_text = "\n",
+                                        });
+                                    }
+
+                                    if (reps.items.len > 0) {
+                                        try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
+                                        try ed_ctx.onEdit();
+                                        current_mode = .insert;
+                                        force_render = true;
+                                    }
                                 },
                                 'O' => {
+                                    var reps = std.ArrayList(Replacement).empty;
+                                    defer reps.deinit(allocator);
+
+                                    // For primary cursor
                                     cursor_pos.column = 0;
-                                    const offset = rope.pointToOffset(cursor_pos);
-                                    try rope.insert(offset, "\n");
-                                    try ed_ctx.onEdit();
-                                    cursor_pos.column = 0;
-                                    current_mode = .insert;
-                                    force_render = true;
+                                    const p_offset = rope.pointToOffset(cursor_pos);
+                                    try reps.append(allocator, .{
+                                        .cursor_idx = 0,
+                                        .start = p_offset,
+                                        .end = p_offset,
+                                        .insert_text = "\n",
+                                    });
+
+                                    // For saved cursors
+                                    for (saved_cursors.items, 0..) |*sc, idx| {
+                                        sc.pos.column = 0;
+                                        const sc_offset = rope.pointToOffset(sc.pos);
+                                        try reps.append(allocator, .{
+                                            .cursor_idx = idx + 1,
+                                            .start = sc_offset,
+                                            .end = sc_offset,
+                                            .insert_text = "\n",
+                                        });
+                                    }
+
+                                    if (reps.items.len > 0) {
+                                        try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, false);
+                                        try ed_ctx.onEdit();
+                                        current_mode = .insert;
+                                        force_render = true;
+                                    }
                                 },
                                 'h' => {
                                     if (cursor_pos.column > 0) {
@@ -937,18 +1245,63 @@ pub fn main(init: std.process.Init) !void {
                                     force_render = true;
                                 },
                                 'x' => {
-                                    const offset = rope.pointToOffset(cursor_pos);
+                                    var reps = std.ArrayList(Replacement).empty;
+                                    defer reps.deinit(allocator);
+
                                     const total_char = rope.tree.root.summary.char_len;
-                                    if (offset < total_char) {
-                                        try rope.delete(offset, 1);
-                                        try ed_ctx.onLineEdit(cursor_pos.row);
-                                        try getLineText(rope, &render_cursor, cursor_pos.row, &line_buf);
-                                        var line_len = line_buf.items.len;
-                                        while (line_len > 0 and (line_buf.items[line_len - 1] == '\n' or line_buf.items[line_len - 1] == '\r')) {
-                                            line_len -= 1;
+
+                                    // Primary cursor range
+                                    const p_range = getSelectionRange(rope, cursor_pos, if (current_mode == .visual or current_mode == .visual_line) visual_anchor_pos else null, current_mode);
+                                    if (p_range.end > p_range.start) {
+                                        try reps.append(allocator, .{
+                                            .cursor_idx = 0,
+                                            .start = p_range.start,
+                                            .end = p_range.end,
+                                            .insert_text = "",
+                                        });
+                                    } else {
+                                        const p_off = rope.pointToOffset(cursor_pos);
+                                        if (p_off < total_char) {
+                                            try reps.append(allocator, .{
+                                                .cursor_idx = 0,
+                                                .start = p_off,
+                                                .end = p_off + 1,
+                                                .insert_text = "",
+                                            });
                                         }
-                                        const max_col = if (line_len > 0) line_len - 1 else 0;
-                                        cursor_pos.column = @min(cursor_pos.column, max_col);
+                                    }
+
+                                    // Saved cursors ranges
+                                    for (saved_cursors.items, 0..) |sc, idx| {
+                                        const sc_range = getSelectionRange(rope, sc.pos, sc.visual_anchor, sc.mode);
+                                        if (sc_range.end > sc_range.start) {
+                                            try reps.append(allocator, .{
+                                                .cursor_idx = idx + 1,
+                                                .start = sc_range.start,
+                                                .end = sc_range.end,
+                                                .insert_text = "",
+                                            });
+                                        } else {
+                                            const sc_off = rope.pointToOffset(sc.pos);
+                                            if (sc_off < total_char) {
+                                                try reps.append(allocator, .{
+                                                    .cursor_idx = idx + 1,
+                                                    .start = sc_off,
+                                                    .end = sc_off + 1,
+                                                    .insert_text = "",
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    if (reps.items.len > 0) {
+                                        try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
+                                        try ed_ctx.onEdit();
+
+                                        try capCursor(rope, &cursor_pos, true);
+                                        for (saved_cursors.items) |*sc| {
+                                            try capCursor(rope, &sc.pos, true);
+                                        }
                                         force_render = true;
                                     }
                                 },
@@ -1096,10 +1449,29 @@ pub fn main(init: std.process.Init) !void {
                         }
                     }
                 } else {
-                    const offset = rope.pointToOffset(cursor_pos);
-                    try rope.insert(offset, seq);
-                    try ed_ctx.onLineEdit(cursor_pos.row);
-                    cursor_pos.column += seq.len;
+                    var reps = std.ArrayList(Replacement).empty;
+                    defer reps.deinit(allocator);
+
+                    const p_off = rope.pointToOffset(cursor_pos);
+                    try reps.append(allocator, .{
+                        .cursor_idx = 0,
+                        .start = p_off,
+                        .end = p_off,
+                        .insert_text = seq,
+                    });
+
+                    for (saved_cursors.items, 0..) |sc, idx| {
+                        const sc_off = rope.pointToOffset(sc.pos);
+                        try reps.append(allocator, .{
+                            .cursor_idx = idx + 1,
+                            .start = sc_off,
+                            .end = sc_off,
+                            .insert_text = seq,
+                        });
+                    }
+
+                    try applyMultiCursorReplacement(rope, &saved_cursors, &cursor_pos, null, allocator, reps.items, true);
+                    try ed_ctx.onEdit();
                     force_render = true;
                 }
             },
@@ -1109,4 +1481,99 @@ pub fn main(init: std.process.Init) !void {
 
     // Reset cursor to make terminal clean on exit
     try tui.restore();
+}
+
+test "applyMultiCursorReplacement basic insert" {
+    const allocator = std.testing.allocator;
+    const rope = try Rope.init(allocator);
+    defer rope.deinit();
+
+    rope.setEnableHistory(true);
+    try rope.insert(0, "hello world");
+
+    var primary_pos = Point{ .row = 0, .column = 5 };
+    var saved_cursors = std.ArrayList(SavedCursor).empty;
+    defer saved_cursors.deinit(allocator);
+    try saved_cursors.append(allocator, .{
+        .pos = Point{ .row = 0, .column = 11 },
+        .visual_anchor = null,
+        .mode = .insert,
+    });
+
+    // Insert "xyz" at both cursors: after "hello" (col 5) and at end of "world" (col 11)
+    const p_off = rope.pointToOffset(primary_pos);
+    const sc_off = rope.pointToOffset(saved_cursors.items[0].pos);
+
+    var reps = [_]Replacement{
+        .{ .cursor_idx = 0, .start = p_off, .end = p_off, .insert_text = "xyz" },
+        .{ .cursor_idx = 1, .start = sc_off, .end = sc_off, .insert_text = "xyz" },
+    };
+
+    try applyMultiCursorReplacement(rope, &saved_cursors, &primary_pos, null, allocator, &reps, true);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try rope.text(&buf);
+
+    try std.testing.expectEqualStrings("helloxyz worldxyz", buf.items);
+    try std.testing.expectEqual(@as(usize, 0), primary_pos.row);
+    try std.testing.expectEqual(@as(usize, 8), primary_pos.column);
+    try std.testing.expectEqual(@as(usize, 0), saved_cursors.items[0].pos.row);
+    try std.testing.expectEqual(@as(usize, 17), saved_cursors.items[0].pos.column);
+
+    // Verify undo works as a single transaction!
+    _ = try rope.undo();
+    buf.clearRetainingCapacity();
+    try rope.text(&buf);
+    try std.testing.expectEqualStrings("hello world", buf.items);
+}
+
+test "applyMultiCursorReplacement with mixed selection and normal cursors" {
+    const allocator = std.testing.allocator;
+    const rope = try Rope.init(allocator);
+    defer rope.deinit();
+
+    rope.setEnableHistory(true);
+    try rope.insert(0, "abcdefgh");
+
+    var primary_pos = Point{ .row = 0, .column = 0 }; // 'a'
+    var saved_cursors = std.ArrayList(SavedCursor).empty;
+    defer saved_cursors.deinit(allocator);
+
+    // Save a cursor selecting "cde" (start index 2, end index 5)
+    try saved_cursors.append(allocator, .{
+        .pos = Point{ .row = 0, .column = 4 }, // index 4 ('e')
+        .visual_anchor = Point{ .row = 0, .column = 2 }, // index 2 ('c')
+        .mode = .visual,
+    });
+
+    // We simulate pressing 'x' in normal mode:
+    // For primary cursor (idx 0), no selection: deletes 'a' (start 0, end 1)
+    // For saved cursor (idx 1), visual selection "cde": deletes "cde" (start 2, end 5)
+    const p_range = getSelectionRange(rope, primary_pos, null, .normal);
+    const sc = saved_cursors.items[0];
+    const sc_range = getSelectionRange(rope, sc.pos, sc.visual_anchor, sc.mode);
+
+    var reps = [_]Replacement{
+        .{
+            .cursor_idx = 0,
+            .start = p_range.start,
+            .end = p_range.start + 1, // single char delete
+            .insert_text = "",
+        },
+        .{
+            .cursor_idx = 1,
+            .start = sc_range.start,
+            .end = sc_range.end,
+            .insert_text = "",
+        },
+    };
+
+    try applyMultiCursorReplacement(rope, &saved_cursors, &primary_pos, null, allocator, &reps, true);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try rope.text(&buf);
+
+    try std.testing.expectEqualStrings("bfgh", buf.items);
 }
