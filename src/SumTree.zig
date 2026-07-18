@@ -50,7 +50,7 @@ pub fn SumTree(comptime Item: type) type {
     const Summary = Item.Summary;
     return struct {
         const Self = @This();
-        pub const MAX_CHILDREN = 8;
+        pub const MAX_CHILDREN = 32;
         pub const MIN_CHILDREN = MAX_CHILDREN / 2;
 
         pub const Node = struct {
@@ -95,16 +95,30 @@ pub fn SumTree(comptime Item: type) type {
 
             pub fn deref(self: *Node, allocator: Allocator) void {
                 self.rc -= 1;
-                if (self.rc == 0) {
-                    switch (self.children) {
+                if (self.rc > 0) return;
+
+                // For a B-tree with MAX_CHILDREN=8, a stack of 1024 can handle a tree
+                // depth of over 100, which is enough for more items than atoms in
+                // the universe. This keeps deref iterative and avoids heap allocation.
+                var stack = BoundedArray(*Node, 1024).empty();
+                stack.append(self);
+
+                while (stack.len > 0) {
+                    const node = stack.data[stack.len - 1];
+                    stack.len -= 1;
+
+                    switch (node.children) {
                         .internal => |internal| {
                             for (internal.slice()) |child| {
-                                child.deref(allocator);
+                                child.rc -= 1;
+                                if (child.rc == 0) {
+                                    stack.append(child);
+                                }
                             }
                         },
                         .leaf => {},
                     }
-                    allocator.destroy(self);
+                    allocator.destroy(node);
                 }
             }
 
@@ -150,7 +164,29 @@ pub fn SumTree(comptime Item: type) type {
         enable_history: bool = false,
         history_index: usize = 0,
         in_transaction: bool = false,
+        is_dirty: bool = false,
+        auto_save_history: bool = false,
+        timestamp: i64 = 0,
+        last_mutation_time: i64 = 0,
+        history_commit_delay: i64 = 2000 * std.time.ns_per_ms,
         history: std.ArrayList(HistoryEntry),
+
+        fn updateTimestamp(self: *Self) i64 {
+            var ts: std.posix.timespec = undefined;
+            var new_time: i64 = 0;
+            switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+                .SUCCESS => {
+                    new_time = @intCast(ts.sec * std.time.ns_per_s + ts.nsec);
+                },
+                else => {},
+            }
+            if (new_time <= self.timestamp) {
+                self.timestamp += 1;
+            } else {
+                self.timestamp = new_time;
+            }
+            return self.timestamp;
+        }
 
         pub const HistoryEntry = struct {
             root: *Node,
@@ -279,18 +315,55 @@ pub fn SumTree(comptime Item: type) type {
         }
 
         pub fn startTransaction(self: *Self) !void {
-            if (self.enable_history and self.history.items.len == 0) {
-                try self.history.append(self.allocator, .{ .root = self.root.ref(), .edit_offset = 0 });
+            if (self.enable_history) {
+                self.in_transaction = true;
+                if (self.history.items.len == 0) {
+                    try self.history.append(self.allocator, .{ .root = self.root.ref(), .edit_offset = 0 });
+                }
             }
         }
 
-        pub fn saveHistory(self: *Self, edit_offset: usize) !void {
+        pub fn commitHistory(self: *Self, edit_offset: usize) !void {
+            if (!self.enable_history) return;
+            defer self.in_transaction = false;
+            if (!self.is_dirty) return;
+
             while (self.history.items.len > self.history_index + 1) {
                 const entry = self.history.pop().?;
                 entry.root.deref(self.allocator);
             }
             try self.history.append(self.allocator, .{ .root = self.root.ref(), .edit_offset = edit_offset });
             self.history_index = self.history.items.len - 1;
+            self.is_dirty = false;
+        }
+
+        pub fn saveHistory(self: *Self, edit_offset: usize) !void {
+            if (!self.enable_history) return;
+            self.is_dirty = true;
+            self.last_mutation_time = self.updateTimestamp();
+            if (!self.auto_save_history) {
+                try self.commitHistory(edit_offset);
+            }
+        }
+
+        pub fn rollbackTransaction(self: *Self) void {
+            if (!self.enable_history or !self.in_transaction) return;
+
+            const old = self.root;
+            self.root = self.history.items[self.history_index].root.ref();
+            old.deref(self.allocator);
+            self.is_dirty = false;
+            self.in_transaction = false;
+        }
+
+        pub fn checkAutoSaveHistory(self: *Self) !void {
+            self.auto_save_history = true;
+            if (self.is_dirty) {
+                const now = self.updateTimestamp();
+                if (now - self.last_mutation_time >= self.history_commit_delay) {
+                    try self.commitHistory(0);
+                }
+            }
         }
 
         pub fn undo(self: *Self) !usize {
@@ -302,6 +375,7 @@ pub fn SumTree(comptime Item: type) type {
             const old = self.root;
             self.root = self.history.items[self.history_index].root.ref();
             old.deref(self.allocator);
+            self.is_dirty = false;
             return edit_offset;
         }
 
@@ -314,6 +388,7 @@ pub fn SumTree(comptime Item: type) type {
             const old = self.root;
             self.root = self.history.items[self.history_index].root.ref();
             old.deref(self.allocator);
+            self.is_dirty = false;
             return edit_offset;
         }
 
@@ -648,12 +723,6 @@ pub fn SumTree(comptime Item: type) type {
         }
 
         pub fn append(self: *Self, other: *Self) !void {
-            if (self.isEmpty()) {
-                const old = self.root;
-                self.root = other.root.ref();
-                old.deref(self.allocator);
-                return;
-            }
             if (other.isEmpty()) {
                 return;
             }
@@ -668,6 +737,14 @@ pub fn SumTree(comptime Item: type) type {
                 if (self.enable_history) self.saveHistory(0) catch {};
             };
 
+            if (self.isEmpty()) {
+                const old = self.root;
+                self.root = other.root.ref();
+                old.deref(self.allocator);
+                self.is_dirty = true;
+                return;
+            }
+
             const res = try self.joinNodes(self.root.ref(), other.root.ref());
             const old = self.root;
             if (res.right) |rn| {
@@ -681,16 +758,11 @@ pub fn SumTree(comptime Item: type) type {
             }
             old.deref(self.allocator);
             self.root = try self.collapseNode(self.root);
+            self.is_dirty = true;
         }
 
         pub fn appendNode(self: *Self, other: **Node) !void {
             const other_is_empty = other.*.isLeaf() and other.*.children.leaf.len == 0;
-            if (self.isEmpty()) {
-                const old = self.root;
-                self.root = other.*;
-                old.deref(self.allocator);
-                return;
-            }
             if (other_is_empty) {
                 other.*.deref(self.allocator);
                 return;
@@ -706,6 +778,14 @@ pub fn SumTree(comptime Item: type) type {
                 if (self.enable_history) self.saveHistory(0) catch {};
             };
 
+            if (self.isEmpty()) {
+                const old = self.root;
+                self.root = other.*;
+                old.deref(self.allocator);
+                self.is_dirty = true;
+                return;
+            }
+
             const res = try self.joinNodes(self.root.ref(), other.*);
             const old = self.root;
             if (res.right) |rn| {
@@ -719,6 +799,7 @@ pub fn SumTree(comptime Item: type) type {
             }
             old.deref(self.allocator);
             self.root = try self.collapseNode(self.root);
+            self.is_dirty = true;
         }
 
         pub fn push(self: *Self, item: Item) !void {
@@ -738,6 +819,7 @@ pub fn SumTree(comptime Item: type) type {
 
             var nl = new_leaf;
             try self.appendNode(&nl);
+            self.is_dirty = true;
         }
 
         pub fn Cursor(comptime Dimension: type) type {

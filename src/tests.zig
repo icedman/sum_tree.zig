@@ -144,6 +144,143 @@ test "generic SumTree undo/redo transaction history" {
     try std.testing.expectEqual(@as(u32, 0), tree.root.summary.sum);
 }
 
+test "generic SumTree manual transaction grouping" {
+    const allocator = std.testing.allocator;
+    const S = SumTree(TestItem);
+
+    const tree = try S.init(allocator, {});
+    defer tree.deinit();
+
+    tree.enable_history = true;
+
+    // 1. Group multiple pushes in a single transaction
+    try tree.startTransaction();
+    try tree.push(TestItem{ .val = 10 });
+    try tree.push(TestItem{ .val = 20 });
+    try tree.push(TestItem{ .val = 30 });
+    try tree.commitHistory(123);
+
+    try std.testing.expectEqual(@as(u32, 60), tree.root.summary.sum);
+    try std.testing.expect(!tree.in_transaction);
+    try std.testing.expect(!tree.is_dirty);
+
+    // 2. Undo should revert all three pushes at once
+    const undo_offset = try tree.undo();
+    try std.testing.expectEqual(@as(usize, 123), undo_offset);
+    try std.testing.expectEqual(@as(u32, 0), tree.root.summary.sum);
+
+    // 3. Redo should restore all of them
+    const redo_offset = try tree.redo();
+    try std.testing.expectEqual(@as(usize, 123), redo_offset);
+    try std.testing.expectEqual(@as(u32, 60), tree.root.summary.sum);
+}
+
+test "generic SumTree transaction rollback" {
+    const allocator = std.testing.allocator;
+    const S = SumTree(TestItem);
+
+    const tree = try S.init(allocator, {});
+    defer tree.deinit();
+
+    tree.enable_history = true;
+
+    // Push initial value
+    try tree.push(TestItem{ .val = 5 });
+    try std.testing.expectEqual(@as(u32, 5), tree.root.summary.sum);
+
+    // Start transaction, push values, and rollback
+    try tree.startTransaction();
+    try tree.push(TestItem{ .val = 10 });
+    try tree.push(TestItem{ .val = 20 });
+    try std.testing.expectEqual(@as(u32, 35), tree.root.summary.sum);
+    try std.testing.expect(tree.in_transaction);
+    try std.testing.expect(tree.is_dirty);
+
+    tree.rollbackTransaction();
+
+    // Verify it rolled back to initial state
+    try std.testing.expectEqual(@as(u32, 5), tree.root.summary.sum);
+    try std.testing.expect(!tree.in_transaction);
+    try std.testing.expect(!tree.is_dirty);
+
+    // Undo should go to empty tree
+    _ = try tree.undo();
+    try std.testing.expectEqual(@as(u32, 0), tree.root.summary.sum);
+}
+
+test "generic SumTree transaction empty commit and redo truncation" {
+    const allocator = std.testing.allocator;
+    const S = SumTree(TestItem);
+
+    const tree = try S.init(allocator, {});
+    defer tree.deinit();
+
+    tree.enable_history = true;
+
+    // 1. Commit with no changes should only have the initial state (length 1)
+    try tree.startTransaction();
+    try tree.commitHistory(0);
+    try std.testing.expectEqual(@as(usize, 1), tree.history.items.len);
+
+    // 2. Perform edits and undos to set up redo history
+    try tree.push(TestItem{ .val = 1 });
+    try tree.push(TestItem{ .val = 2 });
+    _ = try tree.undo(); // back to 1 (index 1 of 3)
+
+    // Redo is available (the "2" state at index 2)
+    try std.testing.expectEqual(@as(usize, 3), tree.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), tree.history_index);
+
+    // 3. New mutation should truncate redo history and append
+    try tree.push(TestItem{ .val = 3 }); // now we have 1 + 3 = 4
+    try std.testing.expectEqual(@as(u32, 4), tree.root.summary.sum);
+    try std.testing.expectEqual(@as(usize, 3), tree.history.items.len); // [empty, 1, 1+3]
+    try std.testing.expectEqual(@as(usize, 2), tree.history_index);
+
+    // Redo should do nothing now (returns 0)
+    try std.testing.expectEqual(@as(usize, 0), try tree.redo());
+}
+
+test "generic SumTree auto_save_history coalescing" {
+    const allocator = std.testing.allocator;
+    const S = SumTree(TestItem);
+
+    const tree = try S.init(allocator, {});
+    defer tree.deinit();
+
+    tree.enable_history = true;
+    tree.auto_save_history = true;
+    // Set low delay of 1ms for testing
+    tree.history_commit_delay = 1 * std.time.ns_per_ms;
+
+    // 1. Perform multiple pushes. Since auto_save is enabled, they are not committed immediately.
+    try tree.push(TestItem{ .val = 5 });
+    try tree.push(TestItem{ .val = 10 });
+
+    // History should only have the initial empty state (length 1)
+    try std.testing.expectEqual(@as(usize, 1), tree.history.items.len);
+    try std.testing.expect(tree.is_dirty);
+
+    // Calling checkAutoSaveHistory immediately should not commit because the delay has not elapsed
+    try tree.checkAutoSaveHistory();
+    try std.testing.expectEqual(@as(usize, 1), tree.history.items.len);
+
+    // Sleep for 2ms to ensure delay has elapsed
+    var ts = std.posix.timespec{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+    var rem: std.posix.timespec = undefined;
+    _ = std.posix.system.nanosleep(&ts, &rem);
+
+    // 2. Now checkAutoSaveHistory should commit
+    try tree.checkAutoSaveHistory();
+    try std.testing.expectEqual(@as(usize, 2), tree.history.items.len);
+    try std.testing.expect(!tree.is_dirty);
+    try std.testing.expectEqual(@as(u32, 15), tree.root.summary.sum);
+
+    // Undo should go back to empty
+    _ = try tree.undo();
+    try std.testing.expectEqual(@as(u32, 0), tree.root.summary.sum);
+}
+
 // -------------------------------------------------------------
 // Rope Tests
 // -------------------------------------------------------------

@@ -67,6 +67,67 @@ pub fn main() !void {
 }
 ```
 
+## Undo/Redo & Transaction History
+
+`SumTree` (and by extension `Rope`) has a powerful built-in history tracking mechanism supporting undo, redo, manual transaction grouping, and time-based auto-save coalescing.
+
+### 1. Enabling History
+
+To use history tracking on a `SumTree` or a `Rope`, you must explicitly enable it:
+
+```zig
+// For a SumTree directly:
+tree.enable_history = true;
+
+// For a Rope:
+rope.setEnableHistory(true); // or rope.tree.enable_history = true;
+```
+
+### 2. Manual Transactions (Grouping Edits)
+
+By default, every mutation (like `push` or `insert`) is treated as a single undo/redo transaction and committed immediately. You can group multiple edits into a single transaction so they are undone/redone as a single action:
+
+```zig
+// Start a manual transaction
+try tree.startTransaction();
+
+try tree.push(item1);
+try tree.push(item2);
+
+// Commit the transaction and save it to history
+try tree.commitHistory(edit_offset);
+```
+
+If something goes wrong during the transaction, you can discard all changes since the transaction started:
+
+```zig
+// Roll back to the state before the current transaction started
+tree.rollbackTransaction();
+```
+
+### 3. Auto-Save History (Time-based Coalescing)
+
+If you are building an editor, you may want typing operations to be automatically coalesced/grouped into single undo steps based on time delays:
+
+- **Enable Auto-Save**: Set `tree.auto_save_history = true;` (or `rope.tree.auto_save_history = true;`).
+- **Set the Commit Delay**: Set the timeout delay using `tree.history_commit_delay` (in nanoseconds). The default is `2000 * std.time.ns_per_ms` (2 seconds).
+- **Check Auto-Save Periodically**: In your editor tick loop or input handler, call `try tree.checkAutoSave();` (or `try rope.tree.checkAutoSave();`). This will automatically commit the current edits if the specified delay has passed since the last mutation.
+
+Example setup:
+```zig
+tree.enable_history = true;
+tree.auto_save_history = true;
+tree.history_commit_delay = 1500 * std.time.ns_per_ms; // Coalesce edits within 1.5 seconds
+
+// In your input loop:
+try tree.push(typed_character);
+
+// In your periodic tick / timer handler:
+try tree.checkAutoSave();
+```
+
+---
+
 ## Running Tests
 
 To run the unit tests:
