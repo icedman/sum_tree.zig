@@ -158,7 +158,7 @@ pub fn TreeMap(comptime K: type, comptime V: type) type {
             }
 
             try left_slice.push(Entry{ .key = key, .value = value });
-            
+
             const suffix_slice = try cursor.suffix();
             defer suffix_slice.deinit();
 

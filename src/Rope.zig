@@ -64,7 +64,10 @@ pub const RopeChunk = struct {
 
 pub const CharDimension = struct {
     val: usize = 0,
-    pub fn zero(cx: void) @This() { _ = cx; return .{}; }
+    pub fn zero(cx: void) @This() {
+        _ = cx;
+        return .{};
+    }
     pub fn addSummary(self: *@This(), s: RopeChunk.Summary, cx: void) void {
         _ = cx;
         self.val += s.char_len;
@@ -73,7 +76,10 @@ pub const CharDimension = struct {
 
 pub const LineDimension = struct {
     val: usize = 0,
-    pub fn zero(cx: void) @This() { _ = cx; return .{}; }
+    pub fn zero(cx: void) @This() {
+        _ = cx;
+        return .{};
+    }
     pub fn addSummary(self: *@This(), s: RopeChunk.Summary, cx: void) void {
         _ = cx;
         self.val += s.line_len;
@@ -82,7 +88,10 @@ pub const LineDimension = struct {
 
 pub const Utf16Dimension = struct {
     val: usize = 0,
-    pub fn zero(cx: void) @This() { _ = cx; return .{}; }
+    pub fn zero(cx: void) @This() {
+        _ = cx;
+        return .{};
+    }
     pub fn addSummary(self: *@This(), s: RopeChunk.Summary, cx: void) void {
         _ = cx;
         self.val += s.utf16_len;
@@ -273,8 +282,6 @@ pub const Rope = struct {
                 try left_slice.push(c);
             }
         }
-
-
 
         const suffix_slice = try cursor.suffix();
         defer suffix_slice.deinit();

@@ -99,7 +99,7 @@ test "generic SumTree Cursor and slicing" {
 
     var cursor = S.Cursor(SumDimension).init(tree);
     const target = SumSeekTarget{ .target = 15 };
-    
+
     // Seek to position 15 with .right bias
     cursor.seekTo(target, .right);
     try std.testing.expectEqual(@as(u32, 15), cursor.position.val);
@@ -338,7 +338,7 @@ test "TreeMap removals" {
 
     try map.insert(4, "four");
     try map.insert(5, "five");
-    
+
     // Remove range [1..4) -> leaves 4 and 5
     try map.removeRange(1, 4);
     try std.testing.expect(!map.containsKey(1));
@@ -373,7 +373,7 @@ test "Rope single chunk delete crash recreation" {
     defer rope.deinit();
 
     try rope.insert(0, "line one\nline two\nline three\nline four");
-    
+
     // Press 'x' at offset 14
     try rope.delete(14, 1);
 
@@ -431,7 +431,7 @@ test "Rope comprehensive randomized fuzzing" {
     var op: usize = 0;
     while (op < 1000) : (op += 1) {
         const action = rand.intRangeLessThan(u8, 0, 100);
-        std.debug.print("Op {}: Action={}, len={}\n", .{op, action, ref.items.len});
+        std.debug.print("Op {}: Action={}, len={}\n", .{ op, action, ref.items.len });
 
         if (action < 45) { // 45% Insert
             const offset = if (ref.items.len == 0) 0 else rand.intRangeAtMost(usize, 0, ref.items.len);
@@ -447,7 +447,7 @@ test "Rope comprehensive randomized fuzzing" {
                 }
             }
 
-            std.debug.print("  -> INSERT at {}, len={}, text='{s}'\n", .{offset, insert_len, content_buf});
+            std.debug.print("  -> INSERT at {}, len={}, text='{s}'\n", .{ offset, insert_len, content_buf });
             try rope.insert(offset, content_buf);
 
             // Update ref
@@ -461,13 +461,12 @@ test "Rope comprehensive randomized fuzzing" {
             const copy = try ref.clone(allocator);
             try ref_history.append(allocator, copy);
             ref_history_index = ref_history.items.len - 1;
-
         } else if (action < 80) { // 35% Delete
             if (ref.items.len > 0) {
                 const offset = rand.intRangeLessThan(usize, 0, ref.items.len);
                 const del_len = rand.intRangeAtMost(usize, 1, @min(ref.items.len - offset, 80));
 
-                std.debug.print("  -> DELETE at {}, len={}\n", .{offset, del_len});
+                std.debug.print("  -> DELETE at {}, len={}\n", .{ offset, del_len });
                 try rope.delete(offset, del_len);
 
                 // Update ref
@@ -569,7 +568,7 @@ test "WrapMap basic operations" {
     // Line 1 is "test\n" (len 5)
     // Line 2 is "" (len 0)
     try std.testing.expectEqual(@as(usize, 3), wrap_map.calculateDisplayRows(11)); // "hello world" (len 11 visible)
-    try std.testing.expectEqual(@as(usize, 1), wrap_map.calculateDisplayRows(4));  // "test" (len 4 visible)
+    try std.testing.expectEqual(@as(usize, 1), wrap_map.calculateDisplayRows(4)); // "test" (len 4 visible)
 
     // Test bufferToDisplay translation
     // Line 0, char 0 ("h") -> Display row 0, col 0

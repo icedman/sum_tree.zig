@@ -5,7 +5,7 @@ const SumTree = sum_tree.SumTree;
 const Bias = sum_tree.Bias;
 
 pub const LineWrapEntry = struct {
-    raw_chars: usize,  // Count of raw buffer characters in this line (including '\n')
+    raw_chars: usize, // Count of raw buffer characters in this line (including '\n')
     display_rows: usize, // Number of screen rows this line takes at the current wrap width
 
     pub const Summary = struct {
