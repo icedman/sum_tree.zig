@@ -19,15 +19,6 @@ pub const DisplayPoint = @import("WrapMap.zig").DisplayPoint;
 pub const expandTabs = @import("WrapMap.zig").expandTabs;
 pub const rawToExpanded = @import("WrapMap.zig").rawToExpanded;
 pub const expandedToRaw = @import("WrapMap.zig").expandedToRaw;
-pub const Selection = @import("Selection.zig").Selection;
-pub const SelectionManager = @import("Selection.zig").SelectionManager;
-pub const Document = @import("Document.zig").Document;
-pub const Editor = @import("Editor.zig").Editor;
-pub const Mode = @import("Editor.zig").Mode;
-pub const SavedCursor = @import("Editor.zig").SavedCursor;
-pub const Key = @import("Editor.zig").Key;
-pub const Result = @import("Editor.zig").Result;
-pub const Replacement = @import("Editor.zig").Replacement;
 pub const tests = @import("tests.zig");
 
 test {

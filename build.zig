@@ -89,27 +89,6 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
-    const editor_exe = b.addExecutable(.{
-        .name = "editor",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/editor.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sum_tree", .module = mod },
-            },
-        }),
-    });
-    b.installArtifact(editor_exe);
-
-    const run_editor_step = b.step("editor", "Run the TUI editor");
-    const run_editor_cmd = b.addRunArtifact(editor_exe);
-    run_editor_step.dependOn(&run_editor_cmd.step);
-    run_editor_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_editor_cmd.addArgs(args);
-    }
-
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

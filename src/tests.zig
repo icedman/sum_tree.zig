@@ -613,29 +613,6 @@ test "WrapMap basic operations" {
     try std.testing.expectEqual(@as(usize, 1), bp_tab.column);
 }
 
-test "SelectionManager basic operations and normalization" {
-    const allocator = std.testing.allocator;
-    const SelectionManager = @import("Selection.zig").SelectionManager;
-
-    var sm = SelectionManager.init(allocator);
-    defer sm.deinit();
-
-    // 1. Add disjoint selections
-    try sm.addSelection(10, 5); // start=5, end=10 (reversed)
-    try sm.addSelection(15, 20); // start=15, end=20
-
-    try std.testing.expectEqual(@as(usize, 2), sm.selections.items.len);
-    try std.testing.expect(sm.isOffsetSelected(7));
-    try std.testing.expect(sm.isOffsetSelected(17));
-    try std.testing.expect(!sm.isOffsetSelected(12));
-
-    // 2. Add overlapping selection that merges
-    try sm.addSelection(8, 16); // overlaps both! [5, 10] and [15, 20] -> should merge into [5, 20]
-    try std.testing.expectEqual(@as(usize, 1), sm.selections.items.len);
-    try std.testing.expectEqual(@as(usize, 5), sm.selections.items[0].start());
-    try std.testing.expectEqual(@as(usize, 20), sm.selections.items[0].end());
-}
-
 test "Word navigation w and b" {
     const allocator = std.testing.allocator;
     const getLineWordStartsHelper = struct {
@@ -680,40 +657,4 @@ test "Word navigation w and b" {
     try std.testing.expectEqual(@as(usize, 7), starts.items[2]);
     try std.testing.expectEqual(@as(usize, 12), starts.items[3]);
     try std.testing.expectEqual(@as(usize, 15), starts.items[4]);
-}
-
-test "Document and Editor multi-buffer basic operations" {
-    const allocator = std.testing.allocator;
-
-    const doc1 = try @import("root.zig").Document.init(allocator, "buffer one text", "doc1.txt");
-    defer doc1.deinit();
-
-    const doc2 = try @import("root.zig").Document.init(allocator, "buffer two content", "doc2.txt");
-    defer doc2.deinit();
-
-    const editor = try @import("root.zig").Editor.init(allocator, doc1, 80);
-    defer editor.deinit();
-
-    // 1. Initial document state
-    try std.testing.expectEqualStrings("doc1.txt", editor.document.filename.?);
-    try std.testing.expectEqual(@as(usize, 0), editor.cursor_pos.row);
-    try std.testing.expectEqual(@as(usize, 0), editor.cursor_pos.column);
-
-    _ = try editor.handleKey(.{ .char = .{ .buf = [_]u8{ 'l', 0, 0, 0, 0, 0, 0, 0 }, .len = 1 } }, 80, 24);
-    try std.testing.expectEqual(@as(usize, 1), editor.cursor_pos.column);
-
-    // Switch active document to doc2
-    try editor.setDocument(doc2, 80);
-    try std.testing.expectEqualStrings("doc2.txt", editor.document.filename.?);
-    try std.testing.expectEqual(@as(usize, 0), editor.cursor_pos.row);
-    try std.testing.expectEqual(@as(usize, 0), editor.cursor_pos.column);
-
-    // Insert character 'X' in insert mode
-    _ = try editor.handleKey(.{ .char = .{ .buf = [_]u8{ 'i', 0, 0, 0, 0, 0, 0, 0 }, .len = 1 } }, 80, 24);
-    _ = try editor.handleKey(.{ .char = .{ .buf = [_]u8{ 'X', 0, 0, 0, 0, 0, 0, 0 }, .len = 1 } }, 80, 24);
-
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-    try editor.document.rope.text(&buf);
-    try std.testing.expectEqualStrings("Xbuffer two content", buf.items);
 }
