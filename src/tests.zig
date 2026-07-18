@@ -133,14 +133,14 @@ test "generic SumTree undo/redo transaction history" {
     try tree.push(TestItem{ .val = 2 });
     try std.testing.expectEqual(@as(u32, 3), tree.root.summary.sum);
 
-    try tree.undo();
+    _ = try tree.undo();
     try std.testing.expectEqual(@as(u32, 1), tree.root.summary.sum);
 
-    try tree.redo();
+    _ = try tree.redo();
     try std.testing.expectEqual(@as(u32, 3), tree.root.summary.sum);
 
-    try tree.undo();
-    try tree.undo();
+    _ = try tree.undo();
+    _ = try tree.undo();
     try std.testing.expectEqual(@as(u32, 0), tree.root.summary.sum);
 }
 
@@ -484,14 +484,14 @@ test "Rope comprehensive randomized fuzzing" {
             }
         } else if (action < 90) { // 10% Undo
             if (ref_history_index > 0) {
-                try rope.undo();
+                _ = try rope.undo();
                 ref_history_index -= 1;
                 ref.clearRetainingCapacity();
                 try ref.appendSlice(allocator, ref_history.items[ref_history_index].items);
             }
         } else { // 10% Redo
             if (ref_history_index < ref_history.items.len - 1) {
-                try rope.redo();
+                _ = try rope.redo();
                 ref_history_index += 1;
                 ref.clearRetainingCapacity();
                 try ref.appendSlice(allocator, ref_history.items[ref_history_index].items);

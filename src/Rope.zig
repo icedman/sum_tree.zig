@@ -291,16 +291,16 @@ pub const Rope = struct {
         left_slice.deinit();
 
         if (self.tree.enable_history) {
-            try self.tree.saveHistory();
+            try self.tree.saveHistory(offset);
         }
     }
 
-    pub fn undo(self: *Self) !void {
-        try self.tree.undo();
+    pub fn undo(self: *Self) !usize {
+        return try self.tree.undo();
     }
 
-    pub fn redo(self: *Self) !void {
-        try self.tree.redo();
+    pub fn redo(self: *Self) !usize {
+        return try self.tree.redo();
     }
 
     pub fn setEnableHistory(self: *Self, enable: bool) void {

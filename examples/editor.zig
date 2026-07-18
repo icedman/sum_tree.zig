@@ -442,37 +442,37 @@ pub fn main(init: std.process.Init) !void {
                 force_render = true;
             },
             .ctrl_z => {
-                rope.undo() catch {
+                const offset = rope.undo() catch {
                     status_message = "Nothing to Undo!";
                     status_timer = 2;
                     force_render = true;
                     continue;
                 };
                 try ed_ctx.onEdit();
-                cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
+                cursor_pos = rope.offsetToPoint(offset);
                 force_render = true;
             },
             .ctrl_y => {
-                rope.redo() catch {
+                const offset = rope.redo() catch {
                     status_message = "Nothing to Redo!";
                     status_timer = 2;
                     force_render = true;
                     continue;
                 };
                 try ed_ctx.onEdit();
-                cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
+                cursor_pos = rope.offsetToPoint(offset);
                 force_render = true;
             },
             .ctrl_r => {
                 if (current_mode == .normal) {
-                    rope.redo() catch {
+                    const offset = rope.redo() catch {
                         status_message = "Nothing to Redo!";
                         status_timer = 2;
                         force_render = true;
                         continue;
                     };
                     try ed_ctx.onEdit();
-                    cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
+                    cursor_pos = rope.offsetToPoint(offset);
                     force_render = true;
                 }
             },
@@ -852,14 +852,14 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 },
                                 'u' => {
-                                    rope.undo() catch {
+                                    const offset = rope.undo() catch {
                                         status_message = "Nothing to Undo!";
                                         status_timer = 2;
                                         force_render = true;
                                         continue;
                                     };
                                     try ed_ctx.onEdit();
-                                    cursor_pos = rope.offsetToPoint(rope.pointToOffset(cursor_pos));
+                                    cursor_pos = rope.offsetToPoint(offset);
                                     force_render = true;
                                 },
                                 'd' => {

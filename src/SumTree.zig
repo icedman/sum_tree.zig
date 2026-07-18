@@ -147,11 +147,15 @@ pub fn SumTree(comptime Item: type) type {
         allocator: Allocator,
         root: *Node,
         cx: Summary.Context,
-
         enable_history: bool = false,
         history_index: usize = 0,
         in_transaction: bool = false,
-        history: std.ArrayList(*Node),
+        history: std.ArrayList(HistoryEntry),
+
+        pub const HistoryEntry = struct {
+            root: *Node,
+            edit_offset: usize = 0,
+        };
 
         pub fn init(allocator: Allocator, cx: Summary.Context) !*Self {
             const tree = try allocator.create(Self);
@@ -160,7 +164,7 @@ pub fn SumTree(comptime Item: type) type {
                 .allocator = allocator,
                 .root = root,
                 .cx = cx,
-                .history = std.ArrayList(*Node).empty,
+                .history = std.ArrayList(HistoryEntry).empty,
             };
             return tree;
         }
@@ -175,7 +179,7 @@ pub fn SumTree(comptime Item: type) type {
                     .allocator = allocator,
                     .root = root,
                     .cx = cx,
-                    .history = std.ArrayList(*Node).empty,
+                    .history = std.ArrayList(HistoryEntry).empty,
                 };
                 return tree;
             }
@@ -245,15 +249,15 @@ pub fn SumTree(comptime Item: type) type {
                 .allocator = allocator,
                 .root = root_node,
                 .cx = cx,
-                .history = std.ArrayList(*Node).empty,
+                .history = std.ArrayList(HistoryEntry).empty,
             };
             return tree;
         }
 
         pub fn deinit(self: *Self) void {
             self.root.deref(self.allocator);
-            for (self.history.items) |node| {
-                node.deref(self.allocator);
+            for (self.history.items) |entry| {
+                entry.root.deref(self.allocator);
             }
             self.history.deinit(self.allocator);
             self.allocator.destroy(self);
@@ -265,7 +269,7 @@ pub fn SumTree(comptime Item: type) type {
                 .allocator = self.allocator,
                 .root = self.root.ref(),
                 .cx = self.cx,
-                .history = std.ArrayList(*Node).empty,
+                .history = std.ArrayList(HistoryEntry).empty,
             };
             return copy;
         }
@@ -276,37 +280,41 @@ pub fn SumTree(comptime Item: type) type {
 
         pub fn startTransaction(self: *Self) !void {
             if (self.enable_history and self.history.items.len == 0) {
-                try self.history.append(self.allocator, self.root.ref());
+                try self.history.append(self.allocator, .{ .root = self.root.ref(), .edit_offset = 0 });
             }
         }
 
-        pub fn saveHistory(self: *Self) !void {
+        pub fn saveHistory(self: *Self, edit_offset: usize) !void {
             while (self.history.items.len > self.history_index + 1) {
-                const node = self.history.pop().?;
-                node.deref(self.allocator);
+                const entry = self.history.pop().?;
+                entry.root.deref(self.allocator);
             }
-            try self.history.append(self.allocator, self.root.ref());
+            try self.history.append(self.allocator, .{ .root = self.root.ref(), .edit_offset = edit_offset });
             self.history_index = self.history.items.len - 1;
         }
 
-        pub fn undo(self: *Self) !void {
+        pub fn undo(self: *Self) !usize {
             if (!self.enable_history) return error.HistoryDisabled;
-            if (self.history_index == 0) return;
+            if (self.history_index == 0) return 0;
 
+            const edit_offset = self.history.items[self.history_index].edit_offset;
             self.history_index -= 1;
             const old = self.root;
-            self.root = self.history.items[self.history_index].ref();
+            self.root = self.history.items[self.history_index].root.ref();
             old.deref(self.allocator);
+            return edit_offset;
         }
 
-        pub fn redo(self: *Self) !void {
+        pub fn redo(self: *Self) !usize {
             if (!self.enable_history) return error.HistoryDisabled;
-            if (self.history_index >= self.history.items.len - 1) return;
+            if (self.history_index >= self.history.items.len - 1) return 0;
 
             self.history_index += 1;
+            const edit_offset = self.history.items[self.history_index].edit_offset;
             const old = self.root;
-            self.root = self.history.items[self.history_index].ref();
+            self.root = self.history.items[self.history_index].root.ref();
             old.deref(self.allocator);
+            return edit_offset;
         }
 
         pub const SplitResult = struct {
@@ -328,7 +336,7 @@ pub fn SumTree(comptime Item: type) type {
                 .allocator = self.allocator,
                 .root = res.left,
                 .cx = self.cx,
-                .history = std.ArrayList(*Node).empty,
+                .history = std.ArrayList(HistoryEntry).empty,
             };
 
             const right_tree = try self.allocator.create(Self);
@@ -336,7 +344,7 @@ pub fn SumTree(comptime Item: type) type {
                 .allocator = self.allocator,
                 .root = res.right,
                 .cx = self.cx,
-                .history = std.ArrayList(*Node).empty,
+                .history = std.ArrayList(HistoryEntry).empty,
             };
 
             return .{ .left = left_tree, .right = right_tree };
@@ -657,7 +665,7 @@ pub fn SumTree(comptime Item: type) type {
             }
             defer if (!was_in) {
                 self.in_transaction = false;
-                if (self.enable_history) self.saveHistory() catch {};
+                if (self.enable_history) self.saveHistory(0) catch {};
             };
 
             const res = try self.joinNodes(self.root.ref(), other.root.ref());
@@ -695,7 +703,7 @@ pub fn SumTree(comptime Item: type) type {
             }
             defer if (!was_in) {
                 self.in_transaction = false;
-                if (self.enable_history) self.saveHistory() catch {};
+                if (self.enable_history) self.saveHistory(0) catch {};
             };
 
             const res = try self.joinNodes(self.root.ref(), other.*);
@@ -721,7 +729,7 @@ pub fn SumTree(comptime Item: type) type {
             }
             defer if (!was_in) {
                 self.in_transaction = false;
-                if (self.enable_history) self.saveHistory() catch {};
+                if (self.enable_history) self.saveHistory(0) catch {};
             };
 
             const new_leaf = try Node.initLeaf(self.allocator, self.cx);
