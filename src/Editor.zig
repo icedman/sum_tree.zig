@@ -273,13 +273,41 @@ pub const Editor = struct {
         self.document.rope.setEnableHistory(false);
         defer self.document.rope.setEnableHistory(true);
 
+        const LineWrapEntry = @import("WrapMap.zig").LineWrapEntry;
+
+        var lines_changed = false;
         for (sorted_reps.items) |rep| {
+            const start_row = self.document.rope.offsetToPoint(rep.start).row;
+            const end_row = self.document.rope.offsetToPoint(rep.end).row;
+            const old_lines_count = end_row - start_row + 1;
+            const num_newlines = std.mem.count(u8, rep.insert_text, "\n");
+            const new_lines_count = num_newlines + 1;
+
+            if (new_lines_count != old_lines_count) {
+                lines_changed = true;
+            }
+
+            const new_entries = try self.allocator.alloc(LineWrapEntry, new_lines_count);
+            defer self.allocator.free(new_entries);
+            @memset(new_entries, LineWrapEntry{ .raw_chars = 10, .display_rows = 1 });
+
+            try self.wrap_map.replace(start_row, old_lines_count, new_entries);
+
             const del_len = rep.end - rep.start;
             if (del_len > 0) {
                 try self.document.rope.delete(rep.start, del_len);
             }
             if (rep.insert_text.len > 0) {
                 try self.document.rope.insert(rep.start, rep.insert_text);
+            }
+
+            if (!lines_changed) {
+                var r: usize = 0;
+                while (r < new_lines_count) : (r += 1) {
+                    if (start_row + r < self.wrap_map.wrapped_bitset.capacity()) {
+                        self.wrap_map.wrapped_bitset.unset(start_row + r);
+                    }
+                }
             }
 
             const delta_len = @as(isize, @intCast(rep.insert_text.len)) - @as(isize, @intCast(del_len));
@@ -310,6 +338,12 @@ pub const Editor = struct {
                     }
                 }
             }
+        }
+
+        if (lines_changed) {
+            const total_lines = self.document.rope.tree.root.summary.line_len + 1;
+            self.wrap_map.wrapped_bitset.deinit();
+            self.wrap_map.wrapped_bitset = try std.DynamicBitSet.initEmpty(self.allocator, total_lines);
         }
 
         try self.document.rope.tree.saveHistory(offsets[0].pos);
@@ -543,7 +577,6 @@ pub const Editor = struct {
 
                     if (reps.items.len > 0) {
                         try self.applyMultiCursorReplacement(reps.items, true);
-                        try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                         try self.syncSelections();
                         return Result{ .force_render = true, .should_exit = false, .save_requested = null };
                     }
@@ -578,7 +611,6 @@ pub const Editor = struct {
 
                     if (reps.items.len > 0) {
                         try self.applyMultiCursorReplacement(reps.items, true);
-                        try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                         try self.syncSelections();
                         return Result{ .force_render = true, .should_exit = false, .save_requested = null };
                     }
@@ -608,7 +640,6 @@ pub const Editor = struct {
                     }
 
                     try self.applyMultiCursorReplacement(reps.items, true);
-                    try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                     try self.syncSelections();
                     return Result{ .force_render = true, .should_exit = false, .save_requested = null };
                 }
@@ -648,7 +679,6 @@ pub const Editor = struct {
                                 if (reps.items.len > 0) {
                                     try self.applyMultiCursorReplacement(reps.items, true);
                                     self.current_mode = .normal;
-                                    try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                                     try self.capCursorPos(&self.cursor_pos, true);
                                     for (self.saved_cursors.items) |*sc_item| {
                                         try self.capCursorPos(&sc_item.pos, true);
@@ -706,7 +736,6 @@ pub const Editor = struct {
 
                                 if (reps.items.len > 0) {
                                     try self.applyMultiCursorReplacement(reps.items, true);
-                                    try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                                     try self.capCursorPos(&self.cursor_pos, true);
                                     for (self.saved_cursors.items) |*sc_item| {
                                         try self.capCursorPos(&sc_item.pos, true);
@@ -782,7 +811,6 @@ pub const Editor = struct {
 
                                     if (reps.items.len > 0) {
                                         try self.applyMultiCursorReplacement(reps.items, true);
-                                        try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                                         self.current_mode = .insert;
                                         try self.syncSelections();
                                         return Result{ .force_render = true, .should_exit = false, .save_requested = null };
@@ -816,7 +844,6 @@ pub const Editor = struct {
 
                                     if (reps.items.len > 0) {
                                         try self.applyMultiCursorReplacement(reps.items, false);
-                                        try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                                         self.current_mode = .insert;
                                         try self.syncSelections();
                                         return Result{ .force_render = true, .should_exit = false, .save_requested = null };
@@ -994,7 +1021,6 @@ pub const Editor = struct {
 
                                     if (reps.items.len > 0) {
                                         try self.applyMultiCursorReplacement(reps.items, true);
-                                        try self.wrap_map.rewrapAll(screen_width, self.document.rope);
 
                                         try self.capCursorPos(&self.cursor_pos, true);
                                         for (self.saved_cursors.items) |*sc_item| {
@@ -1181,7 +1207,6 @@ pub const Editor = struct {
                     }
 
                     try self.applyMultiCursorReplacement(reps.items, true);
-                    try self.wrap_map.rewrapAll(screen_width, self.document.rope);
                     try self.syncSelections();
                     return Result{ .force_render = true, .should_exit = false, .save_requested = null };
                 }
